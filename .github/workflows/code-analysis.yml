@@ -1,0 +1,12 @@
+name: Code Analysis
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  analysis:
+    uses: manasvipaweria/repo-analysis/.github/workflows/reusable-analysis.yml@main
+    secrets:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
