@@ -33,6 +33,12 @@ on:
         type: string
         default: 'main'
 
+      run_id:
+        description: 'Internal analysis run ID'
+        required: false
+        type: string
+        default: ''
+
     secrets:
       GEMINI_API_KEY:
         description: 'Gemini API Key'
@@ -44,6 +50,18 @@ on:
 
       SNYK_TOKEN:
         description: 'Snyk API Token'
+        required: false
+
+      DATABASE_URL:
+        description: 'PostgreSQL Database Connection URL'
+        required: false
+
+      ANALYSIS_BACKEND_URL:
+        description: 'Backend API base URL for report callback'
+        required: false
+
+      ANALYSIS_SECRET:
+        description: 'Shared secret for backend report callback'
         required: false
 
 jobs:
@@ -98,181 +116,36 @@ jobs:
           python -m pip install --upgrade pip
 
           pip install \
-            -r orchestrator-repo/requirements.txt \
-            owasp-depscan
+            ruff bandit semgrep pip-audit mypy pytest import-linter \
+            google-genai openai psycopg pydantic requests pyyaml
+
+          sudo apt-get update && sudo apt-get install -y cloc || true
 
           npm install -g \
             snyk \
             @cyclonedx/cdxgen \
             dependency-cruiser \
             react-doctor \
-            eslint \
-            @deslint/eslint-plugin
+            deslint || true
 
       # =========================================================
-      # Cache dependency scanner database
+      # Execute Analysis
       # =========================================================
 
-      - name: Cache dep-scan VDB
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/.vdb
-          key: depscan-vdb-app-${{ runner.os }}-${{ hashFiles('orchestrator-repo/requirements.txt') }}
-          restore-keys: |
-            depscan-vdb-app-${{ runner.os }}-
-
-      - name: Provision dep-scan VDB
+      - name: Run Orchestrator Analysis
         env:
-          VDB_HOME: ${{ github.workspace }}/.vdb
-        run: |
-          depscan-vdb download --scope app
-
-      # =========================================================
-      # Verify CLI tools
-      # =========================================================
-
-      - name: Verify CLI tools
-        env:
-          VDB_HOME: ${{ github.workspace }}/.vdb
-        run: |
-          depscan --version
-          depscan-vdb path
-          cdxgen --version
-          eslint --version
-          node --version
-          npm --version
-
-      # =========================================================
-      # Prepare Codex state
-      # =========================================================
-
-      - name: Prepare Codex state directory
-        if: ${{ inputs.enable_codex }}
-        run: |
-          mkdir -p "$HOME/.codex/state/plugins/codex-security/scans"
-          chmod -R 700 "$HOME/.codex"
-
-      # =========================================================
-      # Detect frontend / Node project
-      # =========================================================
-
-      - name: Detect frontend project
-        id: frontend
-        shell: bash
-        run: |
-          if [ -f "target-repo/package.json" ]; then
-            echo "project_dir=target-repo" >> "$GITHUB_OUTPUT"
-            echo "Found root package.json"
-
-          elif [ -f "target-repo/frontend/package.json" ]; then
-            echo "project_dir=target-repo/frontend" >> "$GITHUB_OUTPUT"
-            echo "Found frontend/package.json"
-
-          else
-            echo "project_dir=" >> "$GITHUB_OUTPUT"
-            echo "No supported package.json found"
-          fi
-
-      # =========================================================
-      # Install target repository dependencies
-      #
-      # --no-save prevents package.json/package-lock.json changes.
-      # =========================================================
-
-      - name: Install frontend dependencies
-        if: ${{ steps.frontend.outputs.project_dir != '' }}
-        shell: bash
-        run: |
-          cd "${{ steps.frontend.outputs.project_dir }}"
-
-          echo "Installing dependencies in:"
-          pwd
-
-          NODE_ENV=development npm install \
-            --include=dev \
-            --no-save \
-            --no-fund \
-            --no-audit
-
-          NODE_ENV=development npm install \
-            @deslint/eslint-plugin \
-            eslint \
-            --no-save \
-            --no-fund \
-            --no-audit
-
-      # =========================================================
-      # Verify Deslint
-      # =========================================================
-
-      - name: Verify Deslint
-        if: ${{ inputs.enable_deslint && steps.frontend.outputs.project_dir != '' }}
-        shell: bash
-        run: |
-          cd "${{ steps.frontend.outputs.project_dir }}"
-
-          echo "Deslint project directory:"
-          pwd
-
-          if [ -d "node_modules/@deslint/eslint-plugin" ]; then
-            echo "Deslint plugin found."
-          else
-            echo "WARNING: Deslint plugin was not found in local node_modules."
-          fi
-
-          npm list @deslint/eslint-plugin --depth=0 || true
-
-      # =========================================================
-      # Run central orchestrator
-      # =========================================================
-
-      - name: Run Repo Analysis Orchestrator
-        id: analyze
-        shell: bash
-
-        env:
-          # -----------------------------------------------------
-          # Optional credentials
-          #
-          # The adapters/orchestrator handle missing credentials
-          # by returning SKIPPED instead of failing the pipeline.
-          # -----------------------------------------------------
-
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-          # -----------------------------------------------------
-          # AI configuration
-          # -----------------------------------------------------
-
-          AI_PROVIDER: gemini
-          GEMINI_MODEL: gemini-3.5-flash
-          AI_BATCH_SIZE: '5'
-          AI_MAX_OUTPUT_TOKENS: '4000'
-
-          # -----------------------------------------------------
-          # Dependency scanner configuration
-          # -----------------------------------------------------
-
-          VDB_HOME: ${{ github.workspace }}/.vdb
-          DEPSCAN_AUTO_DOWNLOAD: 'false'
-
-          # -----------------------------------------------------
-          # Feature flags
-          # -----------------------------------------------------
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ANALYSIS_RUN_ID: ${{ inputs.run_id }}
 
           ENABLE_DESIGN_AI: ${{ inputs.enable_design_ai }}
           ENABLE_DESLINT: ${{ inputs.enable_deslint }}
 
         run: |
           cd target-repo
-
           rm -f report.json report.csv
-
-          # -----------------------------------------------------
-          # Build tool list
-          # -----------------------------------------------------
 
           TOOLS="${{ inputs.tools }}"
 
@@ -284,42 +157,107 @@ jobs:
             TOOLS="$TOOLS,deslint"
           fi
 
-          # -----------------------------------------------------
-          # Display configuration
-          # -----------------------------------------------------
+          EXTRA_ARGS=""
+          if [ -n "${{ inputs.run_id }}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --run-id ${{ inputs.run_id }}"
+          fi
 
-          echo "=============================================="
-          echo "Repository Analysis"
-          echo "=============================================="
-          echo "Repository:"
-          echo "${{ github.repository }}"
-          echo ""
-          echo "Orchestrator ref:"
-          echo "${{ inputs.orchestrator_ref }}"
-          echo ""
-          echo "Codex enabled:"
-          echo "${{ inputs.enable_codex }}"
-          echo ""
-          echo "Deslint enabled:"
-          echo "${{ inputs.enable_deslint }}"
-          echo ""
-          echo "Design AI enabled:"
-          echo "${{ inputs.enable_design_ai }}"
-          echo ""
-          echo "Tools:"
-          echo "$TOOLS"
-          echo "=============================================="
-
-          # -----------------------------------------------------
-          # Run analysis
-          # -----------------------------------------------------
+          if [ -n "${{ secrets.DATABASE_URL }}" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --persist"
+          fi
 
           python ../orchestrator-repo/analyze_repo.py \
             . \
             --repo-name "${{ github.repository }}" \
             --tools "$TOOLS" \
             --output json,csv \
-            --run-ai
+            --run-ai \
+            $EXTRA_ARGS
+
+      # =========================================================
+      # Callback completed report to backend
+      # =========================================================
+
+      - name: Send completed report to backend
+        env:
+          ANALYSIS_BACKEND_URL: ${{ secrets.ANALYSIS_BACKEND_URL }}
+          ANALYSIS_SECRET: ${{ secrets.ANALYSIS_SECRET }}
+          ANALYSIS_RUN_ID: ${{ inputs.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          cd target-repo
+
+          if [ -z "$ANALYSIS_BACKEND_URL" ]; then
+            echo "[analysis-callback] ANALYSIS_BACKEND_URL is not configured; skipping callback."
+            exit 0
+          fi
+
+          if [ -z "$ANALYSIS_SECRET" ]; then
+            echo "[analysis-callback] ANALYSIS_SECRET is not configured; skipping callback."
+            exit 0
+          fi
+
+          if [ -z "$ANALYSIS_RUN_ID" ]; then
+            echo "[analysis-callback] run_id input is empty; skipping callback."
+            exit 0
+          fi
+
+          if [ ! -s report.json ]; then
+            echo "[analysis-callback] report.json was not generated; skipping callback."
+            exit 0
+          fi
+
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          backend_url = os.environ["ANALYSIS_BACKEND_URL"].rstrip("/")
+          run_id = os.environ["ANALYSIS_RUN_ID"]
+          callback_url = f"{backend_url}/api/analysis/runs/{run_id}/report"
+
+          with open("report.json", "r", encoding="utf-8") as report_file:
+              report = json.load(report_file)
+
+          payload = {
+              "repository": os.environ.get("REPOSITORY"),
+              "branch": os.environ.get("BRANCH"),
+              "commit_sha": os.environ.get("COMMIT_SHA"),
+              "workflow_run_id": os.environ.get("WORKFLOW_RUN_ID"),
+              "status": "COMPLETED",
+              "report": report,
+          }
+
+          request = urllib.request.Request(
+              callback_url,
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {os.environ['ANALYSIS_SECRET']}",
+                  "Content-Type": "application/json",
+                  "Accept": "application/json",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  body = response.read().decode("utf-8", errors="replace")
+                  print(f"[analysis-callback] backend accepted report for run_id={run_id} status={response.status}")
+                  if body:
+                      print(f"[analysis-callback] response: {body[:1000]}")
+          except urllib.error.HTTPError as exc:
+              body = exc.read().decode("utf-8", errors="replace")
+              print(f"[analysis-callback] backend rejected report for run_id={run_id} status={exc.code}: {body[:1000]}")
+              sys.exit(0)
+          except Exception as exc:
+              print(f"[analysis-callback] callback unavailable for run_id={run_id}: {exc}")
+              sys.exit(0)
+          PY
 
       # =========================================================
       # Upload reports

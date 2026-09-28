@@ -1,0 +1,1269 @@
+
+import os
+import base64
+import csv
+import hmac
+import json
+import io
+import zipfile
+import uvicorn
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Any, List, Dict
+
+from src.storage.postgres import get_finding_lifecycle, update_finding_lifecycle, _connect, initialize_schema
+from src.core.models import Finding
+
+app = FastAPI(title="Repo Analysis API - Phase 2")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/repo_analysis")
+ALLOW_MOCK_FALLBACK = os.environ.get("ALLOW_MOCK_FALLBACK", "true").lower() == "true"
+
+class RecheckRequest(BaseModel):
+    repository: str
+    branch: Optional[str] = None
+    commit_sha: Optional[str] = None
+    tool: str
+    rule_id: Optional[str] = None
+    file: Optional[str] = None
+    line: Optional[int] = None
+
+
+def _get_mock_report_summary(run_id="mock-1"):
+    return {
+        "id": run_id,
+        "repository": "Heydo-Tech/repo-orchestrator",
+        "branch": "main",
+        "commit_sha": "abc123mock",
+        "workflow_run_id": "wf-mock",
+        "status": "COMPLETED",
+        "started_at": "2026-09-23T10:00:00Z",
+        "completed_at": "2026-09-23T10:05:00Z",
+        "total_findings": 2
+    }
+
+def _get_mock_report_detail(run_id="mock-1"):
+    summary = _get_mock_report_summary(run_id)
+    metadata = dict(summary)
+    summary["report"] = {
+        "metadata": metadata,
+        "summary": {
+            "security": {"status": "COMPLETED", "count": 1},
+            "dependency_security": {"status": "COMPLETED", "count": 1}
+        },
+        "findings": _mock_findings()
+    }
+    return summary
+
+def _mock_findings():
+    return [
+        {
+            "finding_id": "semgrep-sql-001",
+            "title": "SQL Injection",
+            "category": "security",
+            "severity": "HIGH",
+            "tool": "semgrep",
+            "rule_id": "python.django.security.injection.sql-injection",
+            "location": {
+                "path": "src/auth/login.py",
+                "start_line": 84,
+                "code_snippet": "82 | const user = ...\n83 | const query = ...\n84 | db.query(userInput)\n85 | ..."
+            },
+            "description": "Detected unescaped user input in SQL query.",
+            "remediation": "Use parameterized queries or an ORM.",
+            "lifecycle": {"status": "OPEN", "history": []}
+        },
+        {
+            "finding_id": "snyk-fast-uri-002",
+            "title": "Vulnerable Dependency",
+            "category": "dependency_security",
+            "severity": "CRITICAL",
+            "tool": "snyk",
+            "rule_id": "SNYK-JS-FASTURI-315",
+            "location": {
+                "path": "package.json",
+                "start_line": 14
+            },
+            "description": "fast-uri version 3.1.5 has a known vulnerability.",
+            "remediation": "Upgrade to a non-vulnerable supported version like 3.1.6.",
+            "lifecycle": {"status": "OPEN", "history": []}
+        }
+    ]
+
+def _sanitize_report_for_download(report: dict) -> dict:
+    # Remove any keys that look like secrets from metadata
+    if "metadata" in report:
+        meta = report["metadata"]
+        keys_to_remove = []
+        for k in meta.keys():
+            if "TOKEN" in k.upper() or "KEY" in k.upper() or "SECRET" in k.upper() or "PASSWORD" in k.upper():
+                keys_to_remove.append(k)
+        for k in keys_to_remove:
+            meta[k] = "[REDACTED]"
+    return report
+
+def _generate_csv(report: dict) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Headers
+    writer.writerow([
+        "finding_id", "repository", "tool", "category", "severity", 
+        "priority", "rule_id", "file", "line", "message", "status"
+    ])
+    
+    findings = report.get("findings", [])
+    metadata = report.get("metadata") or {}
+    repo_name = metadata.get("repository") or report.get("repo") or "unknown"
+    
+    for f in findings:
+        writer.writerow([
+            f.get("finding_id", ""),
+            repo_name,
+            f.get("tool", ""),
+            f.get("category", ""),
+            f.get("severity", ""),
+            f.get("priority", ""),
+            f.get("rule_id", ""),
+            f.get("location", {}).get("path", "") if isinstance(f.get("location"), dict) else "",
+            f.get("location", {}).get("start_line", "") if isinstance(f.get("location"), dict) else "",
+            f.get("title", f.get("message", "")),
+            (f.get("lifecycle") or {}).get("status", "OPEN")
+        ])
+        
+    return output.getvalue()
+
+
+@app.get("/api/reports")
+def list_reports(repo: Optional[str] = None):
+    try:
+        initialize_schema(DATABASE_URL)
+        with _connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                if repo:
+                    cur.execute("SELECT id, repository, branch, commit_sha, workflow_run_id, status, started_at, completed_at, report FROM analysis_runs WHERE repository = %s ORDER BY completed_at DESC", (repo,))
+                else:
+                    cur.execute("SELECT id, repository, branch, commit_sha, workflow_run_id, status, started_at, completed_at, report FROM analysis_runs ORDER BY completed_at DESC")
+                
+                rows = cur.fetchall()
+                if not rows and ALLOW_MOCK_FALLBACK:
+                    return {"data_source": "mock", "reports": [_get_mock_report_summary("mock-1"), _get_mock_report_summary("mock-2")]}
+                
+                reports = []
+                for row in rows:
+                    r_id, r_repo, branch, commit, wf_id, status, started_at, completed_at, report_data = row
+                    findings_count = len(report_data.get("findings", []))
+                    reports.append({
+                        "id": r_id,
+                        "repository": r_repo,
+                        "branch": branch,
+                        "commit_sha": commit,
+                        "workflow_run_id": wf_id,
+                        "status": status,
+                        "started_at": started_at.isoformat() if started_at else None,
+                        "completed_at": completed_at.isoformat() if completed_at else None,
+                        "total_findings": findings_count
+                    })
+                return {"data_source": "postgres", "reports": reports}
+    except Exception as e:
+        print("DB connection failed:", e)
+        if ALLOW_MOCK_FALLBACK:
+            return {"data_source": "mock", "reports": [_get_mock_report_summary("mock-1"), _get_mock_report_summary("mock-2")]}
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+@app.get("/api/reports/compare")
+def compare_reports(base: str, current: str):
+    # Fetch base
+    base_report = _fetch_full_report(base)
+    current_report = _fetch_full_report(current)
+    
+    if not base_report or not current_report:
+        raise HTTPException(status_code=404, detail="One or both reports not found")
+        
+    base_findings = {f["finding_id"]: f for f in base_report.get("report", {}).get("findings", [])}
+    current_findings = {f["finding_id"]: f for f in current_report.get("report", {}).get("findings", [])}
+    
+    base_keys = set(base_findings.keys())
+    current_keys = set(current_findings.keys())
+    
+    new_keys = current_keys - base_keys
+    removed_keys = base_keys - current_keys
+    unchanged_keys = base_keys & current_keys
+    
+    return {
+        "data_source": base_report.get("data_source", "unknown"),
+        "comparison": {
+            "base_id": base,
+            "current_id": current,
+            "total_base": len(base_keys),
+            "total_current": len(current_keys),
+            "difference": len(current_keys) - len(base_keys),
+            "new_findings": len(new_keys),
+            "no_longer_detected": len(removed_keys),
+            "unchanged": len(unchanged_keys)
+        }
+    }
+
+
+def _fetch_full_report(run_id: str) -> Optional[dict]:
+    if str(run_id).startswith("mock-") and ALLOW_MOCK_FALLBACK:
+        return {"data_source": "mock", **_get_mock_report_detail(run_id)}
+        
+    try:
+        initialize_schema(DATABASE_URL)
+        with _connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, repository, branch, commit_sha, workflow_run_id, status, started_at, completed_at, report FROM analysis_runs WHERE id = %s", (run_id,))
+                row = cur.fetchone()
+                if row:
+                    r_id, r_repo, branch, commit, wf_id, status, started_at, completed_at, report_data = row
+                    enriched_findings = []
+                    for f in report_data.get("findings", []):
+                        f_id = f.get("finding_id")
+                        lifecycle = get_finding_lifecycle(f_id, DATABASE_URL)
+                        if not lifecycle:
+                            update_finding_lifecycle(f_id, DATABASE_URL, "OPEN", message="Discovered in full scan")
+                            lifecycle = get_finding_lifecycle(f_id, DATABASE_URL)
+                        f["lifecycle"] = lifecycle
+                        enriched_findings.append(f)
+                        
+                    report_data["findings"] = enriched_findings
+                    
+                    return {
+                        "data_source": "postgres",
+                        "id": r_id,
+                        "repository": r_repo,
+                        "branch": branch,
+                        "commit_sha": commit,
+                        "workflow_run_id": wf_id,
+                        "status": status,
+                        "started_at": started_at.isoformat() if started_at else None,
+                        "completed_at": completed_at.isoformat() if completed_at else None,
+                        "total_findings": len(enriched_findings),
+                        "report": report_data
+                    }
+    except Exception as e:
+        print(f"DB error fetching report {run_id}:", e)
+
+    # Fallback to memory runs if DB unavailable or mock fallback
+    from src.storage.postgres import _in_memory_runs
+    try:
+        r_int = int(run_id)
+        if r_int in _in_memory_runs:
+            mem = _in_memory_runs[r_int]
+            rep = mem.get("report", {})
+            return {
+                "data_source": "memory_fallback",
+                "id": mem["id"],
+                "repository": mem["repository"],
+                "branch": mem.get("branch"),
+                "commit_sha": mem.get("commit_sha"),
+                "workflow_run_id": mem.get("workflow_run_id"),
+                "status": mem.get("status"),
+                "started_at": mem.get("started_at"),
+                "completed_at": mem.get("completed_at"),
+                "total_findings": len(rep.get("findings", [])),
+                "report": rep
+            }
+    except Exception:
+        pass
+
+    return None
+
+
+@app.get("/api/reports/{run_id}")
+def get_report(run_id: str):
+    data = _fetch_full_report(run_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Report not found")
+    return data
+
+@app.get("/api/reports/{run_id}/download/json")
+def download_report_json(run_id: str):
+    data = _fetch_full_report(run_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Report not found")
+        
+    report = data.get("report", {})
+    sanitized = _sanitize_report_for_download(report)
+    
+    repo_name = data.get("repository", "repo").replace("/", "-")
+    date_str = (data.get("completed_at") or "2026-09-24")[:10]
+    filename = f"{repo_name}-{date_str}-report.json"
+    
+    return JSONResponse(
+        content=sanitized,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+@app.get("/api/reports/{run_id}/download/csv")
+def download_report_csv(run_id: str):
+    data = _fetch_full_report(run_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Report not found")
+        
+    report = data.get("report", {})
+    csv_content = _generate_csv(report)
+    
+    repo_name = data.get("repository", "repo").replace("/", "-")
+    date_str = (data.get("completed_at") or "2026-09-24")[:10]
+    filename = f"{repo_name}-{date_str}-report.csv"
+    
+    return StreamingResponse(
+        iter([csv_content.encode("utf-8")]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+@app.get("/api/findings")
+def get_findings(repo: str):
+    # Backward compat for Phase 1
+    res = list_reports(repo)
+    reports = res.get("reports", [])
+    if not reports:
+        if ALLOW_MOCK_FALLBACK:
+            return {"data_source": "mock", "findings": _mock_findings()}
+        return {"data_source": "postgres", "findings": []}
+        
+    latest_run_id = reports[0]["id"]
+    full = _fetch_full_report(str(latest_run_id))
+    if not full:
+        return {"data_source": "postgres", "findings": []}
+        
+    return {
+        "data_source": full.get("data_source"),
+        "findings": full.get("report", {}).get("findings", [])
+    }
+
+@app.post("/api/findings/{finding_id}/recheck")
+def recheck_finding(finding_id: str, req: RecheckRequest):
+    try:
+        update_finding_lifecycle(
+            finding_id=finding_id,
+            database_url=DATABASE_URL,
+            status="RECHECKING",
+            commit_sha=req.commit_sha,
+            tool=req.tool,
+            scope="file" if req.file else "project",
+            message="Verification initiated"
+        )
+    except Exception as e:
+        print("DB update failed:", e)
+        pass 
+    
+    try:
+        from src.core.recheck import execute_recheck
+        result = execute_recheck(finding_id, req)
+        
+        try:
+            update_finding_lifecycle(
+                finding_id=finding_id,
+                database_url=DATABASE_URL,
+                status=result["status"],
+                commit_sha=req.commit_sha,
+                tool=result["tool"],
+                scope=result["scope"],
+                message=result["message"]
+            )
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        try:
+            update_finding_lifecycle(
+                finding_id=finding_id,
+                database_url=DATABASE_URL,
+                status="OPEN",
+                message=f"Recheck failed: {str(e)}"
+            )
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+import requests
+from src.storage.postgres import (
+    get_github_connection, save_github_connection, delete_github_connection,
+    get_managed_repos, set_managed_repo
+)
+
+class ConnectRequest(BaseModel):
+    token: str
+
+class SelectRepoRequest(BaseModel):
+    full_name: str
+    owner: str
+    name: str
+    selected: bool
+
+SAFE_GITHUB_RESPONSE_HEADERS = (
+    "X-Accepted-GitHub-Permissions",
+    "X-OAuth-Scopes",
+    "X-Accepted-OAuth-Scopes",
+    "X-GitHub-Request-Id",
+    "X-RateLimit-Remaining",
+    "X-RateLimit-Reset",
+)
+
+WORKFLOW_FILE_NAME = "code-analysis.yml"
+
+def _redact_secret(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _redact_secret(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_secret(v) for v in value]
+    if isinstance(value, str):
+        redacted = value
+        for prefix in ("ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_"):
+            start = redacted.find(prefix)
+            while start != -1:
+                end = start
+                while end < len(redacted) and not redacted[end].isspace():
+                    end += 1
+                redacted = redacted[:start] + "[REDACTED_GITHUB_TOKEN]" + redacted[end:]
+                start = redacted.find(prefix)
+        return redacted
+    return value
+
+def _safe_response_body(response: requests.Response) -> Dict[str, Any]:
+    try:
+        body = response.json()
+    except Exception:
+        body = {"message": response.text}
+    if not isinstance(body, dict):
+        body = {"body": body}
+    return _redact_secret(body)
+
+def _safe_response_headers(response: requests.Response) -> Dict[str, str]:
+    return {
+        header: response.headers.get(header)
+        for header in SAFE_GITHUB_RESPONSE_HEADERS
+        if response.headers.get(header)
+    }
+
+def _github_api_error_context(response: requests.Response) -> Dict[str, Any]:
+    return {
+        "github_status": response.status_code,
+        "github_response": _safe_response_body(response),
+        "github_headers": _safe_response_headers(response),
+    }
+
+def _github_error_message(response: requests.Response) -> str:
+    body = _safe_response_body(response)
+    return str(body.get("message") or body.get("body") or "No message provided by GitHub")
+
+def _validate_github_token(token: str):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    resp = requests.get("https://api.github.com/user", headers=headers, timeout=10)
+    if resp.status_code == 200:
+        data = resp.json()
+        return True, data
+    return False, {"error": "Invalid token or GitHub API error", "status": resp.status_code}
+
+@app.get("/api/github/status")
+def github_status():
+    conn = get_github_connection(DATABASE_URL)
+    if not conn:
+        return {"connected": False}
+    return {
+        "connected": True,
+        "username": conn["username"],
+        "avatar_url": conn["avatar_url"],
+        "token_hint": conn["token_hint"],
+        "connected_at": conn["connected_at"]
+    }
+
+@app.post("/api/github/connect")
+def github_connect(req: ConnectRequest):
+    token = req.token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Token is required")
+        
+    valid, data = _validate_github_token(token)
+    if not valid:
+        raise HTTPException(status_code=401, detail="GitHub authentication failed. Please check your token.")
+        
+    hint = "****" + token[-4:] if len(token) > 4 else "****"
+    
+    # Save directly as plaintext because we don't have encryption setup yet (as permitted by instruction for MVP local dev, but documented)
+    save_github_connection(DATABASE_URL, data.get("login", "unknown"), token, hint, data.get("avatar_url", ""))
+    
+    return {
+        "connected": True,
+        "username": data.get("login", "unknown"),
+        "avatar_url": data.get("avatar_url", ""),
+        "token_hint": hint
+    }
+
+@app.post("/api/github/update-token")
+def github_update_token(req: ConnectRequest):
+    # Same as connect, but semantic difference for UI
+    return github_connect(req)
+
+@app.post("/api/github/test")
+def github_test():
+    conn = get_github_connection(DATABASE_URL)
+    if not conn:
+        return {"status": "Connection failed", "details": "No token configured"}
+        
+    valid, data = _validate_github_token(conn["token"])
+    if not valid:
+        return {"status": "Connection failed", "details": "Token is invalid or expired"}
+        
+    return {"status": "Connected"}
+
+@app.post("/api/github/disconnect")
+def github_disconnect():
+    delete_github_connection(DATABASE_URL)
+    return {"success": True}
+
+@app.get("/api/github/repos")
+def github_repos():
+    conn = get_github_connection(DATABASE_URL)
+    if not conn:
+        raise HTTPException(status_code=401, detail="Not connected to GitHub")
+        
+    headers = {
+        "Authorization": f"Bearer {conn['token']}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    
+    # Pagination placeholder (we just fetch 100 for MVP)
+    resp = requests.get("https://api.github.com/user/repos?per_page=100&sort=updated", headers=headers, timeout=10)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail="GitHub API error while fetching repositories")
+        
+    gh_repos = resp.json()
+    
+    # Merge with managed configuration
+    managed = {r["full_name"]: r for r in get_managed_repos(DATABASE_URL)}
+    
+    results = []
+    for r in gh_repos:
+        perms = r.get("permissions", {})
+        access_list = []
+        if perms.get("push"):
+            access_list.append("Write")
+        elif perms.get("pull"):
+            access_list.append("Read")
+        
+        access_str = "/".join(access_list) if access_list else "Access level unavailable"
+        
+        full_name = r["full_name"]
+        
+        results.append({
+            "full_name": full_name,
+            "name": r["name"],
+            "owner": r["owner"]["login"],
+            "private": r["private"],
+            "default_branch": r["default_branch"],
+            "html_url": r["html_url"],
+            "access": access_str,
+            "selected": managed.get(full_name, {}).get("selected", False),
+            "updated_at": r.get("updated_at")
+        })
+        
+    return {"repositories": results}
+
+@app.post("/api/github/repos/select")
+def github_select_repo(req: SelectRepoRequest):
+    set_managed_repo(DATABASE_URL, req.full_name, req.owner, req.name, req.selected)
+    return {"success": True, "selected": req.selected}
+
+
+
+from src.core.onboarding import (
+    check_onboarding_status, onboard_repository, compute_diff, EXPECTED_WORKFLOW,
+    WORKFLOW_PATH
+)
+from src.storage.postgres import save_repo_onboarding, get_repo_onboarding
+
+@app.get("/api/github/repos/{owner}/{repo}/onboarding-status")
+def api_onboarding_status(owner: str, repo: str):
+    full_name = f"{owner}/{repo}"
+    conn = get_github_connection(DATABASE_URL)
+    if not conn:
+        raise HTTPException(status_code=401, detail="GitHub not connected")
+        
+    status, details = check_onboarding_status(conn["token"], owner, repo)
+    
+    # Save to database
+    save_repo_onboarding(
+        DATABASE_URL, 
+        full_name=full_name, 
+        status=status, 
+        branch_name=details.get("branch"), 
+        pr_number=details.get("pr_number"), 
+        pr_url=details.get("pr_url")
+    )
+    
+    return {
+        "repository": full_name,
+        "status": status,
+        **details
+    }
+
+@app.post("/api/github/repos/{owner}/{repo}/onboard")
+def api_onboard_repo(owner: str, repo: str):
+    full_name = f"{owner}/{repo}"
+    conn = get_github_connection(DATABASE_URL)
+    if not conn:
+        raise HTTPException(status_code=401, detail="GitHub not connected")
+        
+    result = onboard_repository(conn["token"], owner, repo)
+    
+    if result.get("status") == "ERROR":
+        raise HTTPException(status_code=500, detail=result.get("detail", "Onboarding failed"))
+        
+    save_repo_onboarding(
+        DATABASE_URL,
+        full_name=full_name,
+        status=result["status"],
+        branch_name=result.get("branch"),
+        pr_number=result.get("pr_number"),
+        pr_url=result.get("pr_url")
+    )
+    
+    return result
+
+@app.get("/api/github/repos/{owner}/{repo}/onboarding-diff")
+def api_onboarding_diff(owner: str, repo: str):
+    full_name = f"{owner}/{repo}"
+    conn = get_github_connection(DATABASE_URL)
+    if not conn:
+        raise HTTPException(status_code=401, detail="GitHub not connected")
+        
+    status, details = check_onboarding_status(conn["token"], owner, repo)
+    current_content = details.get("current_content", "")
+    diff_text = compute_diff(current_content)
+    
+    return {
+        "repository": full_name,
+        "status": status,
+        "expected_workflow": EXPECTED_WORKFLOW,
+        "current_workflow": current_content,
+        "diff": diff_text
+    }
+
+@app.get("/api/github/repos/{owner}/{repo}/onboarding-pr")
+def api_onboarding_pr(owner: str, repo: str):
+    full_name = f"{owner}/{repo}"
+    conn = get_github_connection(DATABASE_URL)
+    if not conn:
+        raise HTTPException(status_code=401, detail="GitHub not connected")
+        
+    status, details = check_onboarding_status(conn["token"], owner, repo)
+    if status != "ONBOARDING_PR_OPEN":
+        return {"repository": full_name, "has_open_pr": False}
+        
+    return {
+        "repository": full_name,
+        "has_open_pr": True,
+        "pr_number": details.get("pr_number"),
+        "pr_title": details.get("pr_title"),
+        "pr_url": details.get("pr_url"),
+        "pr_state": details.get("pr_state"),
+        "branch": details.get("branch")
+    }
+
+
+
+from src.storage.postgres import (
+    reserve_running_analysis, complete_analysis_run, complete_analysis_run_report,
+    fail_analysis_run, get_current_run
+)
+
+ANALYSIS_SECRET = os.environ.get("ANALYSIS_SECRET", "dev_secret_key_1234")
+
+class RunStartRequest(BaseModel):
+    repository: str
+    branch: Optional[str] = None
+    commit_sha: Optional[str] = None
+    workflow_run_id: Optional[str] = None
+    workflow_url: Optional[str] = None
+
+class RunCompleteRequest(BaseModel):
+    report: Dict[str, Any]
+    workflow_run_id: Optional[str] = None
+    commit_sha: Optional[str] = None
+    branch: Optional[str] = None
+
+class RunReportRequest(BaseModel):
+    repository: Optional[str] = None
+    branch: Optional[str] = None
+    commit_sha: Optional[str] = None
+    workflow_run_id: Optional[str] = None
+    workflow_url: Optional[str] = None
+    status: Optional[str] = "COMPLETED"
+    report: Dict[str, Any]
+
+class RunFailedRequest(BaseModel):
+    error_message: str
+
+def _verify_analysis_secret(secret_header: Optional[str]):
+    if secret_header != ANALYSIS_SECRET and os.environ.get("ENV") == "production":
+        raise HTTPException(status_code=403, detail="Invalid analysis authorization secret")
+
+def _verify_required_analysis_secret(
+    authorization: Optional[str] = None,
+    x_analysis_secret: Optional[str] = None,
+    secret: Optional[str] = None,
+):
+    supplied = None
+    if authorization:
+        scheme, _, credential = authorization.partition(" ")
+        if scheme.lower() == "bearer" and credential:
+            supplied = credential.strip()
+    if not supplied and x_analysis_secret:
+        supplied = x_analysis_secret.strip()
+    if not supplied and secret:
+        supplied = secret.strip()
+
+    if not supplied or not hmac.compare_digest(str(supplied), str(ANALYSIS_SECRET)):
+        raise HTTPException(status_code=403, detail="Invalid analysis authorization secret")
+
+def _github_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Repo-Analysis-Orchestrator",
+    }
+
+def _parse_iso_datetime(value: Optional[str]):
+    if not value:
+        return None
+    import datetime
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
+def _safe_sync_running_analysis_from_github(owner: str, repo: str, current_run: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return _sync_running_analysis_from_github(owner, repo, current_run)
+    except Exception as exc:
+        run_id = current_run.get("id") if current_run else None
+        print(f"[analysis-sync] sync failed run_id={run_id} repository={owner}/{repo} error={exc}")
+        return current_run
+
+def _download_report_from_artifact(artifact: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
+    artifact_id = artifact.get("id")
+    archive_url = artifact.get("archive_download_url")
+    print(f"[analysis-sync] artifact_retrieved id={artifact_id} name={artifact.get('name')}")
+    if not archive_url:
+        raise RuntimeError(f"Artifact {artifact_id} does not include archive_download_url")
+
+    archive_resp = requests.get(archive_url, headers=headers, timeout=30)
+    if archive_resp.status_code != 200:
+        raise RuntimeError(f"Artifact download failed: GitHub HTTP {archive_resp.status_code}")
+
+    with zipfile.ZipFile(io.BytesIO(archive_resp.content)) as archive:
+        report_names = [
+            name for name in archive.namelist()
+            if name.endswith("report.json") and not name.endswith("/")
+        ]
+        if not report_names:
+            raise RuntimeError("Artifact archive does not contain report.json")
+        with archive.open(report_names[0]) as report_file:
+            report = json.load(report_file)
+
+    if not isinstance(report, dict) or not report:
+        raise RuntimeError("Artifact report.json is empty or invalid")
+    if "findings" not in report:
+        raise RuntimeError("Artifact report.json does not contain a findings array")
+    return report
+
+def _sync_running_analysis_from_github(owner: str, repo: str, current_run: Dict[str, Any]) -> Dict[str, Any]:
+    if not current_run or current_run.get("status") != "RUNNING":
+        return current_run
+
+    conn = get_github_connection(DATABASE_URL)
+    if not conn:
+        return current_run
+
+    run_id = current_run.get("id")
+    full_name = f"{owner}/{repo}"
+    branch = current_run.get("branch")
+    started_at = _parse_iso_datetime(current_run.get("started_at"))
+    headers = _github_headers(conn["token"])
+    workflow_id = WORKFLOW_FILE_NAME
+
+    print(f"[analysis-sync] checking run_id={run_id} repository={full_name} workflow={workflow_id} branch={branch}")
+
+    params = {"event": "workflow_dispatch", "per_page": 20}
+    if branch:
+        params["branch"] = branch
+
+    runs_resp = requests.get(
+        f"https://api.github.com/repos/{full_name}/actions/workflows/{workflow_id}/runs",
+        headers=headers,
+        params=params,
+        timeout=15,
+    )
+    if runs_resp.status_code != 200:
+        print(f"[analysis-sync] workflow run lookup failed run_id={run_id} repository={full_name} github_status={runs_resp.status_code}")
+        return current_run
+
+    workflow_runs = runs_resp.json().get("workflow_runs", [])
+    selected_run = None
+    for gh_run in workflow_runs:
+        created_at = _parse_iso_datetime(gh_run.get("created_at"))
+        if started_at and created_at and created_at < started_at:
+            continue
+        selected_run = gh_run
+        break
+
+    if not selected_run:
+        print(f"[analysis-sync] no matching workflow run yet run_id={run_id} repository={full_name}")
+        return current_run
+
+    gh_run_id = str(selected_run.get("id"))
+    gh_status = selected_run.get("status")
+    gh_conclusion = selected_run.get("conclusion")
+    print(f"[analysis-sync] matched workflow run_id={run_id} repository={full_name} github_workflow_run_id={gh_run_id} status={gh_status} conclusion={gh_conclusion}")
+
+    if gh_status != "completed":
+        return current_run
+
+    if gh_conclusion != "success":
+        error_message = f"GitHub workflow run {gh_run_id} completed with conclusion {gh_conclusion or 'unknown'}"
+        fail_analysis_run(DATABASE_URL, int(run_id), error_message)
+        print(f"[analysis-sync] PostgreSQL update run_id={run_id} status=FAILED github_workflow_run_id={gh_run_id}")
+        return get_current_run(DATABASE_URL, full_name) or current_run
+
+    artifacts_resp = requests.get(
+        f"https://api.github.com/repos/{full_name}/actions/runs/{gh_run_id}/artifacts",
+        headers=headers,
+        timeout=15,
+    )
+    if artifacts_resp.status_code != 200:
+        print(f"[analysis-sync] artifact list failed run_id={run_id} repository={full_name} github_workflow_run_id={gh_run_id} github_status={artifacts_resp.status_code}")
+        return current_run
+
+    artifacts = artifacts_resp.json().get("artifacts", [])
+    report_artifact = next(
+        (
+            artifact for artifact in artifacts
+            if not artifact.get("expired") and "repo-analysis-report" in artifact.get("name", "")
+        ),
+        None,
+    )
+    if not report_artifact:
+        error_message = f"GitHub workflow run {gh_run_id} succeeded but no repo-analysis-report artifact was found"
+        fail_analysis_run(DATABASE_URL, int(run_id), error_message)
+        print(f"[analysis-sync] PostgreSQL update run_id={run_id} status=FAILED reason=no_artifact github_workflow_run_id={gh_run_id}")
+        return get_current_run(DATABASE_URL, full_name) or current_run
+
+    try:
+        report = _download_report_from_artifact(report_artifact, headers)
+        complete_analysis_run(
+            DATABASE_URL,
+            int(run_id),
+            report,
+            workflow_run_id=gh_run_id,
+            commit_sha=selected_run.get("head_sha"),
+            branch=selected_run.get("head_branch") or branch,
+        )
+        print(f"[analysis-sync] PostgreSQL update run_id={run_id} status=COMPLETED repository={full_name} github_workflow_run_id={gh_run_id} findings={len(report.get('findings', []))}")
+    except Exception as exc:
+        error_message = f"GitHub workflow run {gh_run_id} succeeded but report artifact persistence failed: {exc}"
+        fail_analysis_run(DATABASE_URL, int(run_id), error_message)
+        print(f"[analysis-sync] PostgreSQL update run_id={run_id} status=FAILED reason=artifact_persist_failed github_workflow_run_id={gh_run_id}")
+
+    return get_current_run(DATABASE_URL, full_name) or current_run
+
+@app.post("/api/analysis/runs/start")
+def api_start_analysis_run(req: RunStartRequest, secret: Optional[str] = None):
+    _verify_analysis_secret(secret)
+    is_new, run_data = reserve_running_analysis(
+        DATABASE_URL, 
+        repository=req.repository, 
+        branch=req.branch, 
+        commit_sha=req.commit_sha,
+        workflow_url=req.workflow_url
+    )
+    return {"is_new": is_new, "run": run_data}
+
+@app.post("/api/analysis/runs/{run_id}/complete")
+def api_complete_analysis_run(run_id: int, req: RunCompleteRequest, secret: Optional[str] = None):
+    _verify_analysis_secret(secret)
+    try:
+        complete_analysis_run(
+            DATABASE_URL,
+            run_id=run_id,
+            report=req.report,
+            workflow_run_id=req.workflow_run_id,
+            commit_sha=req.commit_sha,
+            branch=req.branch
+        )
+    except ValueError as exc:
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to complete analysis run: {exc}")
+    return {"success": True, "run_id": run_id, "status": "COMPLETED"}
+
+@app.post("/api/analysis/runs/{run_id}/report")
+def api_analysis_report_callback(
+    run_id: int,
+    req: RunReportRequest,
+    authorization: Optional[str] = Header(None),
+    x_analysis_secret: Optional[str] = Header(None),
+    secret: Optional[str] = None,
+):
+    _verify_required_analysis_secret(
+        authorization=authorization,
+        x_analysis_secret=x_analysis_secret,
+        secret=secret,
+    )
+    if req.status and req.status != "COMPLETED":
+        raise HTTPException(status_code=400, detail="Report callback only accepts COMPLETED reports")
+    if not isinstance(req.report, dict) or not req.report:
+        raise HTTPException(status_code=400, detail="Report callback requires a non-empty report object")
+    if "findings" not in req.report:
+        raise HTTPException(status_code=400, detail="Report callback requires the generated report.json schema")
+
+    try:
+        updated_run = complete_analysis_run_report(
+            DATABASE_URL,
+            run_id,
+            req.report,
+            repository=req.repository,
+            workflow_run_id=req.workflow_run_id,
+            commit_sha=req.commit_sha,
+            branch=req.branch,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if "not found" in message.lower():
+            raise HTTPException(status_code=404, detail=message)
+        if "belongs to repository" in message.lower():
+            raise HTTPException(status_code=409, detail=message)
+        raise HTTPException(status_code=400, detail=message)
+    except Exception as exc:
+        print(f"[analysis-callback] failed run_id={run_id} repository={req.repository} error={exc}")
+        raise HTTPException(status_code=500, detail=f"Failed to persist analysis report: {exc}")
+
+    print(
+        f"[analysis-callback] completed run_id={run_id} "
+        f"repository={updated_run.get('repository')} findings={len(req.report.get('findings', []))}"
+    )
+    return {
+        "success": True,
+        "run_id": run_id,
+        "status": updated_run.get("status", "COMPLETED"),
+        "repository": updated_run.get("repository"),
+        "completed_at": updated_run.get("completed_at"),
+        "total_findings": updated_run.get("total_findings", len(req.report.get("findings", []))),
+    }
+
+@app.post("/api/analysis/runs/{run_id}/failed")
+def api_fail_analysis_run(run_id: int, req: RunFailedRequest, secret: Optional[str] = None):
+    _verify_analysis_secret(secret)
+    try:
+        fail_analysis_run(DATABASE_URL, run_id=run_id, error_message=req.error_message)
+    except ValueError as exc:
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to mark analysis run failed: {exc}")
+    return {"success": True, "run_id": run_id, "status": "FAILED"}
+
+@app.get("/api/runs")
+def api_list_all_runs():
+    res = list_reports()
+    return res
+
+@app.get("/api/runs/{run_id}")
+def api_get_run_detail(run_id: str):
+    return get_report(run_id)
+
+@app.get("/api/github/repos/{owner}/{repo}/runs")
+def api_get_repo_runs(owner: str, repo: str):
+    full_name = f"{owner}/{repo}"
+    current = get_current_run(DATABASE_URL, full_name)
+    if current and current.get("status") == "RUNNING":
+        _safe_sync_running_analysis_from_github(owner, repo, current)
+    return list_reports(repo=full_name)
+
+@app.get("/api/github/repos/{owner}/{repo}/current-run")
+def api_get_current_repo_run(owner: str, repo: str):
+    full_name = f"{owner}/{repo}"
+    current = get_current_run(DATABASE_URL, full_name)
+    if not current:
+        return {"repository": full_name, "status": "IDLE", "run": None}
+    if current.get("status") == "RUNNING":
+        current = _safe_sync_running_analysis_from_github(owner, repo, current)
+    return {"repository": full_name, "status": current["status"], "run": current}
+
+@app.post("/api/github/repos/{owner}/{repo}/run-analysis")
+def api_trigger_run_analysis(owner: str, repo: str):
+    full_name = f"{owner}/{repo}"
+    
+    # 1. Verify GitHub Connection
+    conn = get_github_connection(DATABASE_URL)
+    if not conn:
+        raise HTTPException(status_code=401, detail="GitHub not connected")
+        
+    token = conn["token"]
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Repo-Analysis-Orchestrator"
+    }
+        
+    # 2. Verify repository access, onboarding status, and workflow availability.
+    ob_status, ob_details = check_onboarding_status(token, owner, repo)
+    if ob_status not in ("UP_TO_DATE", "DRIFT"):
+        raise HTTPException(status_code=400, detail=f"Repository is not onboarded (Status: {ob_status})")
+        
+    default_branch = ob_details.get("default_branch", "main")
+    workflow_id = WORKFLOW_FILE_NAME
+    dispatch_payload = {
+        "ref": default_branch,
+        "inputs": {
+            "run_id": None
+        }
+    }
+
+    repo_resp = requests.get(f"https://api.github.com/repos/{full_name}", headers=headers, timeout=10)
+    if repo_resp.status_code != 200:
+        detail = {
+            "message": f"Repository '{full_name}' is not accessible with the stored GitHub token.",
+            "repository": full_name,
+            "ref": default_branch,
+            **_github_api_error_context(repo_resp),
+        }
+        raise HTTPException(status_code=repo_resp.status_code if repo_resp.status_code in (403, 404) else 502, detail=detail)
+
+    repo_data = repo_resp.json()
+    repo_permissions = repo_data.get("permissions") or {}
+    if repo_data.get("private") and not repo_permissions.get("pull"):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": f"Private repository '{full_name}' is not readable with the stored GitHub token.",
+                "repository": full_name,
+                "ref": default_branch,
+                "repository_permissions": repo_permissions,
+            },
+        )
+    if not repo_permissions.get("push"):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "message": "GitHub Actions dispatch forbidden: token lacks repository write access for the selected repository.",
+                "repository": full_name,
+                "ref": default_branch,
+                "repository_permissions": repo_permissions,
+            },
+        )
+    
+    # Pre-check workflow file on ref to verify workflow_dispatch exists
+    workflow_check_url = f"https://api.github.com/repos/{full_name}/contents/{WORKFLOW_PATH}?ref={default_branch}"
+    try:
+        wf_resp = requests.get(workflow_check_url, headers=headers, timeout=10)
+        if wf_resp.status_code == 200:
+            wf_data = wf_resp.json()
+            if "content" in wf_data:
+                content_decoded = base64.b64decode(wf_data["content"]).decode("utf-8", errors="replace")
+                if "workflow_dispatch" not in content_decoded:
+                    drift_note = " Repository onboarding status is DRIFT and this drift prevents dispatch because the workflow file on the target ref lacks 'workflow_dispatch'." if ob_status == "DRIFT" else ""
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "message": f"Workflow file '{WORKFLOW_PATH}' on ref '{default_branch}' does not contain 'workflow_dispatch'.{drift_note}",
+                            "repository": full_name,
+                            "workflow_file": WORKFLOW_PATH,
+                            "workflow_id": workflow_id,
+                            "ref": default_branch,
+                            "onboarding_status": ob_status,
+                            "drift_prevents_dispatch": ob_status == "DRIFT",
+                        },
+                    )
+        elif wf_resp.status_code == 404:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": f"Workflow file '{WORKFLOW_PATH}' not found on ref '{default_branch}' for repository '{full_name}'.",
+                    "repository": full_name,
+                    "workflow_file": WORKFLOW_PATH,
+                    "workflow_id": workflow_id,
+                    "ref": default_branch,
+                    "onboarding_status": ob_status,
+                    "drift_prevents_dispatch": ob_status == "DRIFT",
+                    **_github_api_error_context(wf_resp),
+                },
+            )
+        elif wf_resp.status_code != 200:
+            raise HTTPException(
+                status_code=wf_resp.status_code if wf_resp.status_code in (403, 404) else 502,
+                detail={
+                    "message": f"Could not verify workflow file '{WORKFLOW_PATH}' on ref '{default_branch}'.",
+                    "repository": full_name,
+                    "workflow_file": WORKFLOW_PATH,
+                    "workflow_id": workflow_id,
+                    "ref": default_branch,
+                    "onboarding_status": ob_status,
+                    **_github_api_error_context(wf_resp),
+                },
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"Pre-check warning for {full_name}: {exc}")
+        pass
+
+    workflow_api_url = f"https://api.github.com/repos/{full_name}/actions/workflows/{workflow_id}"
+    workflow_resp = requests.get(workflow_api_url, headers=headers, timeout=10)
+    if workflow_resp.status_code != 200:
+        raise HTTPException(
+            status_code=workflow_resp.status_code if workflow_resp.status_code in (403, 404) else 502,
+            detail={
+                "message": f"GitHub Actions workflow '{workflow_id}' is not accessible for repository '{full_name}'.",
+                "repository": full_name,
+                "workflow_file": WORKFLOW_PATH,
+                "workflow_id": workflow_id,
+                "ref": default_branch,
+                "onboarding_status": ob_status,
+                "drift_prevents_dispatch": False,
+                **_github_api_error_context(workflow_resp),
+            },
+        )
+
+    workflow_data = workflow_resp.json()
+    workflow_path = workflow_data.get("path")
+    if workflow_path and workflow_path != WORKFLOW_PATH:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"GitHub resolved workflow '{workflow_id}' to '{workflow_path}', expected '{WORKFLOW_PATH}'.",
+                "repository": full_name,
+                "workflow_file": WORKFLOW_PATH,
+                "workflow_id": workflow_id,
+                "ref": default_branch,
+                "onboarding_status": ob_status,
+                "drift_prevents_dispatch": ob_status == "DRIFT",
+            },
+        )
+    
+    # 3. ATOMICALLY RESERVE RUN IN POSTGRES BEFORE TRIGGERING GITHUB ACTIONS
+    is_new, run_data = reserve_running_analysis(
+        DATABASE_URL, 
+        repository=full_name, 
+        branch=default_branch,
+        workflow_url=f"https://github.com/{full_name}/actions"
+    )
+    
+    if not is_new:
+        return {
+            "status": "already_running",
+            "run_id": str(run_data["id"]),
+            "repository": full_name,
+            "run": run_data,
+            "message": "Analysis is already running for this repository."
+        }
+        
+    run_id = run_data["id"]
+    
+    # 4. Trigger GitHub Actions via workflow_dispatch
+    dispatch_url = f"https://api.github.com/repos/{full_name}/actions/workflows/{workflow_id}/dispatches"
+    dispatch_payload["inputs"]["run_id"] = str(run_id)
+    
+    try:
+        dispatch_resp = requests.post(
+            dispatch_url,
+            headers=headers,
+            json=dispatch_payload,
+            timeout=10
+        )
+    except Exception as exc:
+        err_msg = f"Network error contacting GitHub API: {str(exc)}"
+        fail_analysis_run(DATABASE_URL, run_id, err_msg)
+        raise HTTPException(status_code=502, detail=err_msg)
+    
+    # HTTP 204 No Content indicates successful dispatch
+    if dispatch_resp.status_code not in (204, 201, 200):
+        # Extract GitHub response headers and body without exposing tokens
+        resp_body = _safe_response_body(dispatch_resp)
+        gh_message = resp_body.get("message", "No message provided by GitHub")
+        accepted_perms = dispatch_resp.headers.get("X-Accepted-GitHub-Permissions", "")
+        oauth_scopes = dispatch_resp.headers.get("X-OAuth-Scopes", "")
+        accepted_scopes = dispatch_resp.headers.get("X-Accepted-OAuth-Scopes", "")
+        
+        req_perms = accepted_perms or accepted_scopes or oauth_scopes or "actions:write / workflow"
+        diagnostic_detail = {
+            "repository": full_name,
+            "workflow_file": WORKFLOW_PATH,
+            "workflow_id": workflow_id,
+            "dispatch_url": dispatch_url,
+            "ref": default_branch,
+            "onboarding_status": ob_status,
+            "drift_prevents_dispatch": False,
+            "required_permissions": req_perms,
+            "repository_permissions": repo_permissions,
+            **_github_api_error_context(dispatch_resp),
+        }
+        
+        if dispatch_resp.status_code == 403:
+            detail_msg = (
+                f"GitHub Actions dispatch forbidden: token lacks Actions write permission or repository/workflow access. "
+                f"(GitHub HTTP 403: {gh_message}. Required permissions: {req_perms}. "
+                f"Repository permission check: push={repo_permissions.get('push')}, pull={repo_permissions.get('pull')})."
+            )
+            fail_analysis_run(DATABASE_URL, run_id, detail_msg)
+            diagnostic_detail["message"] = detail_msg
+            raise HTTPException(status_code=403, detail=diagnostic_detail)
+        elif dispatch_resp.status_code == 404:
+            detail_msg = (
+                f"GitHub Actions workflow not found: '{WORKFLOW_PATH}' on ref '{default_branch}' was not found or is inaccessible. (GitHub HTTP 404: {gh_message})."
+            )
+            fail_analysis_run(DATABASE_URL, run_id, detail_msg)
+            diagnostic_detail["message"] = detail_msg
+            raise HTTPException(status_code=404, detail=diagnostic_detail)
+        elif dispatch_resp.status_code == 422:
+            detail_msg = (
+                f"GitHub Actions dispatch unprocessable: workflow file on '{default_branch}' may be missing 'workflow_dispatch' trigger or has syntax errors. (GitHub HTTP 422: {gh_message})."
+            )
+            fail_analysis_run(DATABASE_URL, run_id, detail_msg)
+            diagnostic_detail["message"] = detail_msg
+            raise HTTPException(status_code=422, detail=diagnostic_detail)
+        else:
+            detail_msg = f"Failed to trigger GitHub Actions workflow: HTTP {dispatch_resp.status_code} - {gh_message}"
+            fail_analysis_run(DATABASE_URL, run_id, detail_msg)
+            diagnostic_detail["message"] = detail_msg
+            raise HTTPException(status_code=502, detail=diagnostic_detail)
+        
+    return {
+        "status": "started",
+        "run_id": str(run_id),
+        "repository": full_name,
+        "branch": default_branch,
+        "workflow_file": WORKFLOW_PATH,
+        "workflow_id": workflow_id,
+        "workflow_url": f"https://github.com/{full_name}/actions"
+    }
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
