@@ -158,10 +158,6 @@ jobs:
           fi
 
           EXTRA_ARGS=""
-          if [ -n "${{ inputs.run_id }}" ]; then
-            EXTRA_ARGS="$EXTRA_ARGS --run-id ${{ inputs.run_id }}"
-          fi
-
           if [ -n "${{ secrets.DATABASE_URL }}" ]; then
             EXTRA_ARGS="$EXTRA_ARGS --persist"
           fi
