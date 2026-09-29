@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -34,6 +35,9 @@ CREATE TABLE IF NOT EXISTS finding_lifecycle (
     last_verified_commit TEXT,
     verification_tool TEXT,
     verification_scope TEXT,
+    recheck_attempt_id TEXT,
+    recheck_workflow_run_id TEXT,
+    recheck_workflow_run_url TEXT,
     history JSONB NOT NULL DEFAULT '[]'::jsonb
 );
 
@@ -49,6 +53,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS unique_active_running_analysis
 CREATE INDEX IF NOT EXISTS analysis_runs_report_idx
     ON analysis_runs USING GIN (report);
 """
+
+_schema_ready_urls: set[str] = set()
+_schema_init_lock = threading.Lock()
 
 
 def _connect(database_url: str):
@@ -66,10 +73,15 @@ def _connect(database_url: str):
 
 def initialize_schema(database_url: str) -> None:
     """Create the persistence table and indexes if they do not exist."""
-    with _connect(database_url) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(SCHEMA)
-            cursor.execute('''
+    if database_url in _schema_ready_urls:
+        return
+    with _schema_init_lock:
+        if database_url in _schema_ready_urls:
+            return
+        with _connect(database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(SCHEMA)
+                cursor.execute('''
             CREATE TABLE IF NOT EXISTS github_connections (
                 id SERIAL PRIMARY KEY,
                 github_username TEXT NOT NULL,
@@ -78,8 +90,8 @@ def initialize_schema(database_url: str) -> None:
                 avatar_url TEXT,
                 connected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
-            ''')
-            cursor.execute('''
+                ''')
+                cursor.execute('''
             CREATE TABLE IF NOT EXISTS managed_repositories (
                 github_full_name TEXT PRIMARY KEY,
                 owner TEXT NOT NULL,
@@ -87,8 +99,8 @@ def initialize_schema(database_url: str) -> None:
                 selected BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
-            ''')
-            cursor.execute('''
+                ''')
+                cursor.execute('''
             CREATE TABLE IF NOT EXISTS repo_onboarding (
                 github_full_name TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
@@ -97,16 +109,22 @@ def initialize_schema(database_url: str) -> None:
                 pr_url TEXT,
                 last_checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
-            ''')
-            cursor.execute('''
+                ''')
+                cursor.execute('''
             ALTER TABLE analysis_runs ALTER COLUMN report DROP NOT NULL;
             ALTER TABLE analysis_runs ALTER COLUMN report SET DEFAULT '{}'::jsonb;
-            ''')
-            cursor.execute('''
+                ''')
+                cursor.execute('''
             ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS error_message TEXT;
             ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS workflow_url TEXT;
             ALTER TABLE analysis_runs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
-            ''')
+                ''')
+                cursor.execute('''
+            ALTER TABLE finding_lifecycle ADD COLUMN IF NOT EXISTS recheck_attempt_id TEXT;
+            ALTER TABLE finding_lifecycle ADD COLUMN IF NOT EXISTS recheck_workflow_run_id TEXT;
+            ALTER TABLE finding_lifecycle ADD COLUMN IF NOT EXISTS recheck_workflow_run_url TEXT;
+                ''')
+        _schema_ready_urls.add(database_url)
 
 
 
@@ -174,7 +192,10 @@ def update_finding_lifecycle(
     commit_sha: Optional[str] = None,
     tool: Optional[str] = None,
     scope: Optional[str] = None,
-    message: Optional[str] = None
+    message: Optional[str] = None,
+    recheck_attempt_id: Optional[str] = None,
+    workflow_run_id: Optional[str] = None,
+    workflow_run_url: Optional[str] = None,
 ) -> None:
     initialize_schema(database_url)
     with _connect(database_url) as connection:
@@ -198,10 +219,11 @@ def update_finding_lifecycle(
                 cursor.execute(
                     """
                     INSERT INTO finding_lifecycle
-                        (finding_id, status, last_verified_commit, verification_tool, verification_scope, history)
-                    VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                        (finding_id, status, last_verified_commit, verification_tool, verification_scope,
+                         recheck_attempt_id, recheck_workflow_run_id, recheck_workflow_run_url, history)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                     """,
-                    (finding_id, status, commit_sha, tool, scope, json.dumps(new_history))
+                    (finding_id, status, commit_sha, tool, scope, recheck_attempt_id, workflow_run_id, workflow_run_url, json.dumps(new_history))
                 )
             else:
                 history = row[0]
@@ -214,17 +236,20 @@ def update_finding_lifecycle(
                         last_verified_commit = %s,
                         verification_tool = %s,
                         verification_scope = %s,
+                        recheck_attempt_id = COALESCE(%s, recheck_attempt_id),
+                        recheck_workflow_run_id = COALESCE(%s, recheck_workflow_run_id),
+                        recheck_workflow_run_url = COALESCE(%s, recheck_workflow_run_url),
                         history = %s::jsonb
                     WHERE finding_id = %s
                     """,
-                    (status, commit_sha, tool, scope, json.dumps(history), finding_id)
+                    (status, commit_sha, tool, scope, recheck_attempt_id, workflow_run_id, workflow_run_url, json.dumps(history), finding_id)
                 )
 
 def get_finding_lifecycle(finding_id: str, database_url: str) -> dict[str, Any]:
     initialize_schema(database_url)
     with _connect(database_url) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT status, first_detected_at, last_checked_at, last_verified_commit, verification_tool, verification_scope, history FROM finding_lifecycle WHERE finding_id = %s", (finding_id,))
+            cursor.execute("SELECT status, first_detected_at, last_checked_at, last_verified_commit, verification_tool, verification_scope, recheck_attempt_id, recheck_workflow_run_id, recheck_workflow_run_url, history FROM finding_lifecycle WHERE finding_id = %s", (finding_id,))
             row = cursor.fetchone()
             if row:
                 return {
@@ -234,9 +259,98 @@ def get_finding_lifecycle(finding_id: str, database_url: str) -> dict[str, Any]:
                     "last_verified_commit": row[3],
                     "verification_tool": row[4],
                     "verification_scope": row[5],
-                    "history": row[6]
+                    "recheck_attempt_id": row[6],
+                    "recheck_workflow_run_id": row[7],
+                    "recheck_workflow_run_url": row[8],
+                    "history": row[9]
                 }
             return {}
+
+
+def get_or_create_findings_lifecycle(
+    finding_ids: list[str], database_url: str
+) -> dict[str, dict[str, Any]]:
+    """Return lifecycle state for a report in one database transaction.
+
+    Report reads previously opened one or two PostgreSQL connections for every
+    finding.  Real reports contain hundreds of findings, so that made the API
+    look unavailable.  This bulk form preserves the initial OPEN history entry
+    and the existing targeted-recheck lifecycle schema.
+    """
+    unique_ids = list(dict.fromkeys(finding_id for finding_id in finding_ids if finding_id))
+    if not unique_ids:
+        return {}
+
+    import datetime
+
+    initialize_schema(database_url)
+    with _connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT finding_id, status, first_detected_at, last_checked_at,
+                       last_verified_commit, verification_tool,
+                       verification_scope, recheck_attempt_id, recheck_workflow_run_id,
+                       recheck_workflow_run_url, history
+                FROM finding_lifecycle
+                WHERE finding_id = ANY(%s)
+                """,
+                (unique_ids,),
+            )
+            rows = cursor.fetchall()
+            found_ids = {row[0] for row in rows}
+            missing_ids = [finding_id for finding_id in unique_ids if finding_id not in found_ids]
+
+            if missing_ids:
+                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                cursor.executemany(
+                    """
+                    INSERT INTO finding_lifecycle (finding_id, status, history)
+                    VALUES (%s, 'OPEN', %s::jsonb)
+                    ON CONFLICT (finding_id) DO NOTHING
+                    """,
+                    [
+                        (
+                            finding_id,
+                            json.dumps([{
+                                "timestamp": now_iso,
+                                "status": "OPEN",
+                                "commit": None,
+                                "tool": None,
+                                "message": "Discovered in full scan",
+                            }]),
+                        )
+                        for finding_id in missing_ids
+                    ],
+                )
+                cursor.execute(
+                    """
+                    SELECT finding_id, status, first_detected_at, last_checked_at,
+                           last_verified_commit, verification_tool,
+                           verification_scope, recheck_attempt_id, recheck_workflow_run_id,
+                           recheck_workflow_run_url, history
+                    FROM finding_lifecycle
+                    WHERE finding_id = ANY(%s)
+                    """,
+                    (unique_ids,),
+                )
+                rows = cursor.fetchall()
+
+    return {
+        row[0]: {
+            "status": row[1],
+            "first_detected_at": row[2].isoformat() if row[2] else None,
+            "last_checked_at": row[3].isoformat() if row[3] else None,
+            "last_verified_commit": row[4],
+            "verification_tool": row[5],
+            "verification_scope": row[6],
+            "recheck_attempt_id": row[7],
+            "recheck_workflow_run_id": row[8],
+            "recheck_workflow_run_url": row[9],
+            "history": row[10],
+        }
+        for row in rows
+    }
 
 
 # In-memory fallback cache when Postgres is offline

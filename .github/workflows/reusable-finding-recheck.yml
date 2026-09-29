@@ -6,6 +6,9 @@ on:
       finding_id:
         required: true
         type: string
+      attempt_id:
+        required: true
+        type: string
       tool:
         required: true
         type: string
@@ -22,7 +25,7 @@ on:
         required: false
         type: string
       commit_sha:
-        required: false
+        required: true
         type: string
     secrets:
       SNYK_TOKEN:
@@ -43,6 +46,7 @@ jobs:
       - name: Initialise safe result
         env:
           FINDING_ID: ${{ inputs.finding_id }}
+          ATTEMPT_ID: ${{ inputs.attempt_id }}
           TOOL: ${{ inputs.tool }}
           RULE_ID: ${{ inputs.rule_id }}
         run: |
@@ -51,6 +55,7 @@ jobs:
           with open('recheck-result.json', 'w', encoding='utf-8') as output:
               json.dump({
                   'finding_id': os.environ['FINDING_ID'],
+                  'attempt_id': os.environ['ATTEMPT_ID'],
                   'tool': os.environ['TOOL'],
                   'rule_id': os.environ['RULE_ID'],
                   'status': 'FAILED',
@@ -58,10 +63,15 @@ jobs:
           PY
 
       - name: Checkout target repository at requested commit
+        id: checkout_target
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.commit_sha || github.sha }}
           path: target-repo
+
+      - name: Record checked commit
+        id: checked_commit
+        run: echo "commit_sha=$(git -C target-repo rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -85,6 +95,7 @@ jobs:
         id: targeted_recheck
         env:
           FINDING_ID: ${{ inputs.finding_id }}
+          ATTEMPT_ID: ${{ inputs.attempt_id }}
           TOOL: ${{ inputs.tool }}
           RULE_ID: ${{ inputs.rule_id }}
           FILE_PATH: ${{ inputs.file_path }}
@@ -102,7 +113,7 @@ jobs:
           rule_id = os.environ['RULE_ID']
           finding_id = os.environ['FINDING_ID']
           file_path = os.environ.get('FILE_PATH', '')
-          result = {'finding_id': finding_id, 'tool': tool, 'rule_id': rule_id, 'status': 'FAILED'}
+          result = {'finding_id': finding_id, 'attempt_id': os.environ['ATTEMPT_ID'], 'tool': tool, 'rule_id': rule_id, 'status': 'FAILED'}
 
           def save():
               with open('recheck-result.json', 'w', encoding='utf-8') as output:
@@ -162,6 +173,8 @@ jobs:
           ANALYSIS_SECRET: ${{ secrets.ANALYSIS_SECRET }}
           REPOSITORY: ${{ github.repository }}
           WORKFLOW_RUN_ID: ${{ github.run_id }}
+          REQUESTED_COMMIT_SHA: ${{ inputs.commit_sha }}
+          CHECKED_COMMIT_SHA: ${{ steps.checked_commit.outputs.commit_sha }}
         run: |
           python - <<'PY'
           import json, os, urllib.error, urllib.request
@@ -172,6 +185,7 @@ jobs:
               payload = json.load(input_file)
           payload['repository'] = os.environ['REPOSITORY']
           payload['workflow_run_id'] = os.environ['WORKFLOW_RUN_ID']
+          payload['commit_sha'] = os.environ.get('CHECKED_COMMIT_SHA') or os.environ['REQUESTED_COMMIT_SHA']
           url = os.environ['ANALYSIS_BACKEND_URL'].rstrip('/') + '/api/findings/' + payload['finding_id'] + '/recheck-result'
           request = urllib.request.Request(
               url, data=json.dumps(payload).encode('utf-8'), method='POST',
@@ -180,8 +194,12 @@ jobs:
           try:
               with urllib.request.urlopen(request, timeout=30) as response:
                   print(f"[recheck-callback] backend accepted result status={response.status}")
+          except urllib.error.HTTPError as exc:
+              print(f'[recheck-callback] backend rejected result status={exc.code}; result artifact was preserved.')
+              raise SystemExit(1)
           except Exception:
               print('[recheck-callback] backend callback unavailable; artifact remains available.')
+              raise SystemExit(1)
           PY
 
       - name: Upload targeted recheck result
@@ -192,3 +210,15 @@ jobs:
           path: recheck-result.json
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Mark inconclusive targeted recheck unsuccessful
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          with open('recheck-result.json', encoding='utf-8') as input_file:
+              result = json.load(input_file)
+          if result.get('status') == 'FAILED':
+              print('[targeted-recheck] check was inconclusive; callback result remains OPEN.')
+              raise SystemExit(1)
+          PY

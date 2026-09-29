@@ -71,13 +71,18 @@ def validate_recheck_file_path(file_path: str | None) -> str | None:
     return path.as_posix()
 
 
-def build_recheck_dispatch(finding_id: str, req) -> tuple[dict, dict]:
+def build_recheck_dispatch(finding_id: str, req, attempt_id: str) -> tuple[dict, dict]:
     """Return canonical repository identity and a strict workflow input payload."""
     tool = str(req.tool or "").strip().lower()
     if tool not in SUPPORTED_RECHECK_TOOLS:
         raise ValueError(f"Targeted recheck not supported for tool: {tool or 'missing'}")
     if not req.rule_id:
         raise ValueError("Targeted recheck requires the original rule ID")
+    commit_sha = str(getattr(req, "commit_sha", None) or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit_sha):
+        raise ValueError("Targeted recheck requires the full report commit SHA")
+    if not attempt_id:
+        raise ValueError("Targeted recheck requires a server-generated attempt ID")
 
     identity = normalize_github_repository(
         getattr(req, "repository", None),
@@ -90,10 +95,11 @@ def build_recheck_dispatch(finding_id: str, req) -> tuple[dict, dict]:
 
     return identity, {
         "recheck_finding_id": str(finding_id),
+        "recheck_attempt_id": str(attempt_id),
         "recheck_tool": tool,
         "recheck_rule_id": str(req.rule_id),
         "recheck_file_path": file_path or "",
         "recheck_line_start": str(getattr(req, "line", None) or ""),
         "recheck_line_end": str(getattr(req, "line_end", None) or getattr(req, "line", None) or ""),
-        "recheck_commit_sha": str(getattr(req, "commit_sha", None) or ""),
+        "recheck_commit_sha": commit_sha,
     }

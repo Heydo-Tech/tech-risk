@@ -19,6 +19,9 @@ on:
         description: 'Finding ID for a targeted recheck'
         required: false
         type: string
+      recheck_attempt_id:
+        required: false
+        type: string
       recheck_tool:
         required: false
         type: string
@@ -58,6 +61,7 @@ jobs:
     uses: manasvipaweria/repo-analysis/.github/workflows/reusable-finding-recheck.yml@main
     with:
       finding_id: ${{ inputs.recheck_finding_id }}
+      attempt_id: ${{ inputs.recheck_attempt_id }}
       tool: ${{ inputs.recheck_tool }}
       rule_id: ${{ inputs.recheck_rule_id }}
       file_path: ${{ inputs.recheck_file_path }}

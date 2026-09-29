@@ -6,6 +6,8 @@ import hmac
 import json
 import io
 import zipfile
+import uuid
+import re
 import uvicorn
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -62,6 +64,8 @@ class RecheckResultRequest(BaseModel):
     status: str
     message: Optional[str] = None
     workflow_run_id: Optional[str] = None
+    attempt_id: Optional[str] = None
+    commit_sha: Optional[str] = None
 
 
 def _get_mock_report_summary(run_id="mock-1"):
@@ -589,7 +593,8 @@ def recheck_finding(finding_id: str, req: RecheckRequest):
     This endpoint intentionally never clones, downloads, or executes target code.
     """
     try:
-        identity, dispatch_inputs = build_recheck_dispatch(finding_id, req)
+        attempt_id = str(uuid.uuid4())
+        identity, dispatch_inputs = build_recheck_dispatch(finding_id, req, attempt_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -654,6 +659,7 @@ def recheck_finding(finding_id: str, req: RecheckRequest):
         tool=dispatch_inputs["recheck_tool"],
         scope="file" if dispatch_inputs["recheck_file_path"] else "project",
         message="Targeted GitHub Actions recheck dispatched",
+        recheck_attempt_id=attempt_id,
     )
     dispatch_response = requests.post(
         f"https://api.github.com/repos/{identity['full_name']}/actions/workflows/{WORKFLOW_FILE_NAME}/dispatches",
@@ -669,6 +675,7 @@ def recheck_finding(finding_id: str, req: RecheckRequest):
             tool=dispatch_inputs["recheck_tool"],
             scope="file" if dispatch_inputs["recheck_file_path"] else "project",
             message=f"Targeted GitHub Actions recheck could not be dispatched (HTTP {dispatch_response.status_code})",
+            recheck_attempt_id=attempt_id,
         )
         raise HTTPException(
             status_code=dispatch_response.status_code if dispatch_response.status_code in (403, 404) else 502,
@@ -679,6 +686,7 @@ def recheck_finding(finding_id: str, req: RecheckRequest):
         "repository": identity["full_name"],
         "tool": dispatch_inputs["recheck_tool"],
         "status": "RECHECKING",
+        "attempt_id": attempt_id,
     }
 
 
@@ -1065,6 +1073,16 @@ def api_finding_recheck_result(
         raise HTTPException(status_code=400, detail="Unsupported recheck tool")
     if status not in {"FIXED", "STILL_PRESENT", "FAILED"}:
         raise HTTPException(status_code=400, detail="Invalid targeted recheck result status")
+    try:
+        attempt_id = str(uuid.UUID(str(req.attempt_id or "")))
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Recheck callback requires a valid attempt ID")
+    commit_sha = str(req.commit_sha or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit_sha):
+        raise HTTPException(status_code=400, detail="Recheck callback requires a valid checked commit SHA")
+    workflow_run_id = str(req.workflow_run_id or "").strip()
+    if not workflow_run_id.isdigit():
+        raise HTTPException(status_code=400, detail="Recheck callback requires a valid GitHub workflow run ID")
 
     finding = _finding_for_recheck(identity["full_name"], finding_id)
     if not finding:
@@ -1074,10 +1092,16 @@ def api_finding_recheck_result(
     if str(finding.get("rule_id") or "") != str(req.rule_id or ""):
         raise HTTPException(status_code=400, detail="Recheck rule ID does not match the selected finding")
 
-    lifecycle = get_finding_lifecycle(finding_id, DATABASE_URL)
     target_status = status if status in {"FIXED", "STILL_PRESENT"} else "OPEN"
+    lifecycle = get_finding_lifecycle(finding_id, DATABASE_URL)
+    if lifecycle.get("recheck_attempt_id") != attempt_id:
+        raise HTTPException(status_code=409, detail="Stale or unknown targeted recheck callback was ignored")
+    if lifecycle.get("last_verified_commit") != commit_sha:
+        raise HTTPException(status_code=409, detail="Targeted recheck callback commit does not match the active attempt")
     if lifecycle.get("status") == target_status and lifecycle.get("verification_tool") == tool:
         return {"finding_id": finding_id, "status": target_status, "idempotent": True}
+    if lifecycle.get("status") != "RECHECKING":
+        raise HTTPException(status_code=409, detail="Targeted recheck callback does not belong to an active attempt")
 
     # Callback-provided messages are deliberately not persisted: they could
     # contain tool output. Store only a safe lifecycle message instead.
@@ -1093,12 +1117,18 @@ def api_finding_recheck_result(
         tool=tool,
         scope="project" if tool == "snyk" else "file",
         message=message,
+        commit_sha=commit_sha,
+        recheck_attempt_id=attempt_id,
+        workflow_run_id=workflow_run_id,
+        workflow_run_url=f"https://github.com/{identity['full_name']}/actions/runs/{workflow_run_id}",
     )
     return {
         "finding_id": finding_id,
         "repository": identity["full_name"],
         "status": target_status,
         "recheck_status": status,
+        "workflow_run_id": workflow_run_id,
+        "workflow_run_url": f"https://github.com/{identity['full_name']}/actions/runs/{workflow_run_id}",
     }
 
 def _github_headers(token: str) -> Dict[str, str]:
