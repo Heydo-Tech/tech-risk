@@ -13,8 +13,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Any, List, Dict
 
-from src.storage.postgres import get_finding_lifecycle, update_finding_lifecycle, _connect, initialize_schema
+from src.storage.postgres import (
+    get_or_create_findings_lifecycle,
+    get_finding_lifecycle,
+    update_finding_lifecycle,
+    _connect,
+    initialize_schema,
+)
 from src.core.models import Finding
+from src.core.recheck import (
+    SUPPORTED_RECHECK_TOOLS,
+    build_recheck_dispatch,
+    normalize_github_repository,
+)
 
 app = FastAPI(title="Repo Analysis API - Phase 2")
 
@@ -27,16 +38,30 @@ app.add_middleware(
 )
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/repo_analysis")
-ALLOW_MOCK_FALLBACK = os.environ.get("ALLOW_MOCK_FALLBACK", "true").lower() == "true"
+# Demo data must never look like repository data in a normal run.  It remains
+# available only when a developer deliberately opts in.
+ALLOW_MOCK_FALLBACK = os.environ.get("ALLOW_MOCK_FALLBACK", "false").lower() == "true"
 
 class RecheckRequest(BaseModel):
-    repository: str
+    repository: Optional[str] = None
+    owner: Optional[str] = None
+    name: Optional[str] = None
     branch: Optional[str] = None
     commit_sha: Optional[str] = None
     tool: str
     rule_id: Optional[str] = None
     file: Optional[str] = None
     line: Optional[int] = None
+    line_end: Optional[int] = None
+
+
+class RecheckResultRequest(BaseModel):
+    repository: str
+    tool: str
+    rule_id: str
+    status: str
+    message: Optional[str] = None
+    workflow_run_id: Optional[str] = None
 
 
 def _get_mock_report_summary(run_id="mock-1"):
@@ -151,9 +176,9 @@ def list_reports(repo: Optional[str] = None):
         with _connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
                 if repo:
-                    cur.execute("SELECT id, repository, branch, commit_sha, workflow_run_id, status, started_at, completed_at, report FROM analysis_runs WHERE repository = %s ORDER BY completed_at DESC", (repo,))
+                    cur.execute("SELECT id, repository, branch, commit_sha, workflow_run_id, status, started_at, completed_at, report FROM analysis_runs WHERE repository = %s ORDER BY id DESC", (repo,))
                 else:
-                    cur.execute("SELECT id, repository, branch, commit_sha, workflow_run_id, status, started_at, completed_at, report FROM analysis_runs ORDER BY completed_at DESC")
+                    cur.execute("SELECT id, repository, branch, commit_sha, workflow_run_id, status, started_at, completed_at, report FROM analysis_runs ORDER BY id DESC")
                 
                 rows = cur.fetchall()
                 if not rows and ALLOW_MOCK_FALLBACK:
@@ -162,6 +187,7 @@ def list_reports(repo: Optional[str] = None):
                 reports = []
                 for row in rows:
                     r_id, r_repo, branch, commit, wf_id, status, started_at, completed_at, report_data = row
+                    report_data = report_data if isinstance(report_data, dict) else {}
                     findings_count = len(report_data.get("findings", []))
                     reports.append({
                         "id": r_id,
@@ -176,7 +202,30 @@ def list_reports(repo: Optional[str] = None):
                     })
                 return {"data_source": "postgres", "reports": reports}
     except Exception as e:
-        print("DB connection failed:", e)
+        print(f"[reports] PostgreSQL list failed repository={repo or 'all'} error={e}")
+        # Never replace a real, completed fallback report with demo findings.
+        # This path is primarily useful during local recovery; production is
+        # expected to supply a working DATABASE_URL.
+        from src.storage.postgres import _in_memory_runs
+        memory_reports = []
+        for memory_run in _in_memory_runs.values():
+            if repo and memory_run.get("repository") != repo:
+                continue
+            report_data = memory_run.get("report")
+            memory_reports.append({
+                "id": memory_run.get("id"),
+                "repository": memory_run.get("repository"),
+                "branch": memory_run.get("branch"),
+                "commit_sha": memory_run.get("commit_sha"),
+                "workflow_run_id": memory_run.get("workflow_run_id"),
+                "status": memory_run.get("status"),
+                "started_at": memory_run.get("started_at"),
+                "completed_at": memory_run.get("completed_at"),
+                "total_findings": len(report_data.get("findings", [])) if isinstance(report_data, dict) else 0,
+            })
+        if memory_reports:
+            memory_reports.sort(key=lambda item: int(item.get("id") or 0), reverse=True)
+            return {"data_source": "memory_fallback", "reports": memory_reports}
         if ALLOW_MOCK_FALLBACK:
             return {"data_source": "mock", "reports": [_get_mock_report_summary("mock-1"), _get_mock_report_summary("mock-2")]}
         raise HTTPException(status_code=500, detail="Database connection failed")
@@ -221,37 +270,46 @@ def _fetch_full_report(run_id: str) -> Optional[dict]:
         
     try:
         initialize_schema(DATABASE_URL)
+        row = None
         with _connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT id, repository, branch, commit_sha, workflow_run_id, status, started_at, completed_at, report FROM analysis_runs WHERE id = %s", (run_id,))
                 row = cur.fetchone()
-                if row:
-                    r_id, r_repo, branch, commit, wf_id, status, started_at, completed_at, report_data = row
-                    enriched_findings = []
-                    for f in report_data.get("findings", []):
-                        f_id = f.get("finding_id")
-                        lifecycle = get_finding_lifecycle(f_id, DATABASE_URL)
-                        if not lifecycle:
-                            update_finding_lifecycle(f_id, DATABASE_URL, "OPEN", message="Discovered in full scan")
-                            lifecycle = get_finding_lifecycle(f_id, DATABASE_URL)
-                        f["lifecycle"] = lifecycle
-                        enriched_findings.append(f)
-                        
-                    report_data["findings"] = enriched_findings
-                    
-                    return {
-                        "data_source": "postgres",
-                        "id": r_id,
-                        "repository": r_repo,
-                        "branch": branch,
-                        "commit_sha": commit,
-                        "workflow_run_id": wf_id,
-                        "status": status,
-                        "started_at": started_at.isoformat() if started_at else None,
-                        "completed_at": completed_at.isoformat() if completed_at else None,
-                        "total_findings": len(enriched_findings),
-                        "report": report_data
-                    }
+        # The report SELECT transaction must be closed before the lifecycle
+        # helper opens its own connection and performs schema-safe inserts.
+        # Keeping it open creates a self-inflicted relation lock.
+        if row:
+            r_id, r_repo, branch, commit, wf_id, status, started_at, completed_at, report_data = row
+            report_data = dict(report_data) if isinstance(report_data, dict) else {}
+            raw_findings = report_data.get("findings", [])
+            lifecycle_by_id = get_or_create_findings_lifecycle(
+                [finding.get("finding_id") for finding in raw_findings],
+                DATABASE_URL,
+            )
+            enriched_findings = []
+            for finding in raw_findings:
+                enriched = dict(finding)
+                enriched["lifecycle"] = lifecycle_by_id.get(
+                    finding.get("finding_id"),
+                    {"status": finding.get("status", "OPEN"), "history": []},
+                )
+                enriched_findings.append(enriched)
+
+            report_data["findings"] = enriched_findings
+
+            return {
+                "data_source": "postgres",
+                "id": r_id,
+                "repository": r_repo,
+                "branch": branch,
+                "commit_sha": commit,
+                "workflow_run_id": wf_id,
+                "status": status,
+                "started_at": started_at.isoformat() if started_at else None,
+                "completed_at": completed_at.isoformat() if completed_at else None,
+                "total_findings": len(enriched_findings),
+                "report": report_data
+            }
     except Exception as e:
         print(f"DB error fetching report {run_id}:", e)
 
@@ -327,68 +385,301 @@ def download_report_csv(run_id: str):
 
 @app.get("/api/findings")
 def get_findings(repo: str):
-    # Backward compat for Phase 1
+    # Use the newest COMPLETED run containing a real report.  A newer RUNNING
+    # row must not hide the last usable scan.
     res = list_reports(repo)
     reports = res.get("reports", [])
-    if not reports:
-        if ALLOW_MOCK_FALLBACK:
-            return {"data_source": "mock", "findings": _mock_findings()}
-        return {"data_source": "postgres", "findings": []}
-        
-    latest_run_id = reports[0]["id"]
-    full = _fetch_full_report(str(latest_run_id))
+    completed = [
+        report for report in reports
+        if report.get("status") == "COMPLETED" and int(report.get("total_findings") or 0) >= 0
+    ]
+    full = None
+    for report in completed:
+        candidate = _fetch_full_report(str(report["id"]))
+        if candidate and isinstance(candidate.get("report"), dict) and "findings" in candidate["report"]:
+            full = candidate
+            break
     if not full:
-        return {"data_source": "postgres", "findings": []}
-        
+        if ALLOW_MOCK_FALLBACK and not reports:
+            return {"data_source": "mock", "repository": repo, "run_id": "mock-1", "findings": _mock_findings()}
+        return {"data_source": res.get("data_source", "postgres"), "repository": repo, "run_id": None, "findings": []}
+
+    report = full.get("report", {})
+    normalized_tools, normalized_findings = _normalize_analysis_tools(report)
     return {
         "data_source": full.get("data_source"),
-        "findings": full.get("report", {}).get("findings", [])
+        "repository": repo,
+        "run_id": full.get("id"),
+        "branch": full.get("branch"),
+        "commit_sha": full.get("commit_sha"),
+        "tools": normalized_tools,
+        "findings": normalized_findings,
     }
+
+
+_TOOL_LABELS = {
+    "ruff": "Ruff",
+    "bandit": "Bandit",
+    "semgrep": "Semgrep",
+    "pip-audit": "Pip Audit",
+    "mypy": "Mypy",
+    "pytest": "Pytest",
+    "import-linter": "Import Linter",
+    "snyk": "Snyk",
+    "dep-scan": "Dependency Scan",
+    "dependency-cruiser": "Dependency Cruiser",
+    "sonarqube": "SonarQube",
+    "react-doctor": "React Doctor",
+    "codex-security": "Codex Security",
+    "codex-architecture": "Codex Architecture",
+    "apnimandi-design": "ApniMandi Design",
+    "deslint": "Deslint",
+}
+
+# These identifiers are emitted by the orchestrator's deterministic
+# post-processing stage.  They are not independently configured adapters and
+# therefore must not appear as separate user-facing tools.
+_COMPLIANCE_FINDING_SOURCES = {
+    "data-flow-extractor",
+    "dpdp-engine",
+    "spdi-engine",
+    "cra-engine",
+    "cert-in-engine",
+    "repo-orchestrator-trai-dlt-engine",
+    "security_evidence",
+}
+_COMPLIANCE_RULE_PREFIXES = ("TCPA-", "EPRIVACY-")
+
+
+def _tool_label(tool_id: str) -> str:
+    return _TOOL_LABELS.get(
+        tool_id,
+        " ".join(part.capitalize() for part in tool_id.replace("_", "-").split("-") if part),
+    )
+
+
+def _normalize_analysis_tools(report: dict) -> tuple[list[dict], list[dict]]:
+    """Build user-facing tools from report execution metadata.
+
+    ``summary.*.tools`` is authoritative for configured/executed adapters and
+    their execution state.  ``detected_by`` is used only to attribute real
+    findings to those tools, never to invent the executed-tool list.
+    """
+    tools: dict[str, dict] = {}
+    status_priority = {"COMPLETED": 1, "NOT_APPLICABLE": 2, "SKIPPED": 2, "ERROR": 3}
+
+    for category in (report.get("summary") or {}).values():
+        if not isinstance(category, dict):
+            continue
+        for tool_id, metadata in (category.get("tools") or {}).items():
+            if not isinstance(metadata, dict):
+                metadata = {}
+            execution_status = str(metadata.get("status") or "SKIPPED").upper()
+            existing = tools.get(tool_id)
+            if not existing:
+                tools[tool_id] = {
+                    "id": tool_id,
+                    "label": _tool_label(tool_id),
+                    "execution_status": execution_status,
+                    "error_message": metadata.get("error_message"),
+                    "finding_count": 0,
+                }
+            elif status_priority.get(execution_status, 2) > status_priority.get(existing["execution_status"], 2):
+                existing["execution_status"] = execution_status
+                existing["error_message"] = metadata.get("error_message")
+
+    normalized_findings = []
+    for raw_finding in report.get("findings") or []:
+        finding = dict(raw_finding)
+        sources = finding.get("detected_by") or ([finding.get("tool")] if finding.get("tool") else [])
+        analysis_tools = []
+        unknown_sources = []
+        has_compliance_source = str(finding.get("rule_id") or "").upper().startswith(_COMPLIANCE_RULE_PREFIXES)
+        for source in filter(None, sources):
+            if source in tools:
+                analysis_tools.append(source)
+            elif source in _COMPLIANCE_FINDING_SOURCES:
+                has_compliance_source = True
+            else:
+                unknown_sources.append(source)
+
+        if has_compliance_source:
+            compliance_id = "orchestrator-compliance"
+            tools.setdefault(compliance_id, {
+                "id": compliance_id,
+                "label": "Compliance analysis",
+                "execution_status": "COMPLETED",
+                "error_message": None,
+                "finding_count": 0,
+            })
+            analysis_tools.append(compliance_id)
+
+        if unknown_sources or not analysis_tools:
+            other_id = "other-analysis"
+            tools.setdefault(other_id, {
+                "id": other_id,
+                "label": "Other analysis",
+                "execution_status": "COMPLETED",
+                "error_message": None,
+                "finding_count": 0,
+            })
+            analysis_tools.append(other_id)
+
+        analysis_tools = list(dict.fromkeys(analysis_tools))
+        finding["analysis_tools"] = analysis_tools
+        if unknown_sources:
+            finding["unmapped_sources"] = list(dict.fromkeys(unknown_sources))
+        normalized_findings.append(finding)
+        for tool_id in analysis_tools:
+            tools[tool_id]["finding_count"] += 1
+
+    for tool in tools.values():
+        execution_status = tool["execution_status"]
+        if execution_status == "ERROR":
+            tool["status"] = "FAILED"
+        elif execution_status in {"SKIPPED", "NOT_APPLICABLE"}:
+            tool["status"] = "SKIPPED"
+        elif tool["finding_count"]:
+            tool["status"] = "FINDINGS"
+        else:
+            tool["status"] = "CLEAN"
+
+    status_order = {"FINDINGS": 0, "CLEAN": 1, "FAILED": 2, "SKIPPED": 2}
+    normalized_tools = sorted(
+        tools.values(),
+        key=lambda tool: (status_order.get(tool["status"], 3), -tool["finding_count"], tool["label"].lower()),
+    )
+    return normalized_tools, normalized_findings
+
+def _finding_for_recheck(repository: str, finding_id: str) -> Optional[dict]:
+    """Find a real persisted finding without fetching repository contents."""
+    reports_result = list_reports(repo=repository)
+    for report_summary in reports_result.get("reports", []):
+        if report_summary.get("status") != "COMPLETED":
+            continue
+        full_report = _fetch_full_report(str(report_summary["id"]))
+        for finding in (full_report or {}).get("report", {}).get("findings", []):
+            if str(finding.get("finding_id")) == str(finding_id):
+                return finding
+    return None
+
+
+def _finding_supports_recheck_tool(finding: dict, tool: str) -> bool:
+    """Do not allow a client to recheck an arbitrary tool against a finding."""
+    sources = finding.get("detected_by") or finding.get("tool") or []
+    if isinstance(sources, str):
+        sources = [sources]
+    normalized_sources = {str(source).strip().lower() for source in sources if source}
+    return tool in normalized_sources
+
+
+def _github_recheck_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Repo-Analysis-Orchestrator",
+    }
+
 
 @app.post("/api/findings/{finding_id}/recheck")
 def recheck_finding(finding_id: str, req: RecheckRequest):
+    """Dispatch a strict, targeted recheck to the selected repository's runner.
+
+    This endpoint intentionally never clones, downloads, or executes target code.
+    """
     try:
+        identity, dispatch_inputs = build_recheck_dispatch(finding_id, req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    finding = _finding_for_recheck(identity["full_name"], finding_id)
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding was not found in a completed report for this repository")
+    if not _finding_supports_recheck_tool(finding, dispatch_inputs["recheck_tool"]):
+        raise HTTPException(status_code=400, detail="Requested tool does not match the selected finding")
+    if str(finding.get("rule_id") or "") != dispatch_inputs["recheck_rule_id"]:
+        raise HTTPException(status_code=400, detail="Requested rule ID does not match the selected finding")
+
+    lifecycle = get_finding_lifecycle(finding_id, DATABASE_URL)
+    if lifecycle.get("status") == "RECHECKING":
+        return {
+            "finding_id": finding_id,
+            "repository": identity["full_name"],
+            "status": "RECHECKING",
+            "already_rechecking": True,
+        }
+
+    connection = get_github_connection(DATABASE_URL)
+    if not connection:
+        raise HTTPException(status_code=401, detail="GitHub not connected")
+    headers = _github_recheck_headers(connection["token"])
+
+    # Resolve the workflow ref from GitHub rather than trusting a client branch.
+    repo_response = requests.get(
+        f"https://api.github.com/repos/{identity['full_name']}", headers=headers, timeout=15
+    )
+    if repo_response.status_code != 200:
+        raise HTTPException(
+            status_code=repo_response.status_code if repo_response.status_code in (403, 404) else 502,
+            detail={"message": "Selected repository is not accessible for targeted recheck.", **_github_api_error_context(repo_response)},
+        )
+    default_branch = repo_response.json().get("default_branch") or "main"
+
+    workflow_url = (
+        f"https://api.github.com/repos/{identity['full_name']}/contents/"
+        f".github/workflows/{WORKFLOW_FILE_NAME}?ref={default_branch}"
+    )
+    workflow_response = requests.get(workflow_url, headers=headers, timeout=15)
+    if workflow_response.status_code != 200:
+        raise HTTPException(
+            status_code=400 if workflow_response.status_code == 404 else 502,
+            detail="The repository workflow is unavailable. Update the onboarding workflow before rechecking findings.",
+        )
+    try:
+        workflow_text = base64.b64decode(workflow_response.json().get("content", "")).decode("utf-8")
+    except Exception:
+        raise HTTPException(status_code=400, detail="The repository workflow could not be read for targeted recheck.")
+    if "workflow_dispatch" not in workflow_text or "recheck_finding_id" not in workflow_text:
+        raise HTTPException(
+            status_code=400,
+            detail="The repository workflow does not support targeted recheck. Update the onboarding workflow first.",
+        )
+
+    update_finding_lifecycle(
+        finding_id=finding_id,
+        database_url=DATABASE_URL,
+        status="RECHECKING",
+        commit_sha=dispatch_inputs["recheck_commit_sha"] or None,
+        tool=dispatch_inputs["recheck_tool"],
+        scope="file" if dispatch_inputs["recheck_file_path"] else "project",
+        message="Targeted GitHub Actions recheck dispatched",
+    )
+    dispatch_response = requests.post(
+        f"https://api.github.com/repos/{identity['full_name']}/actions/workflows/{WORKFLOW_FILE_NAME}/dispatches",
+        headers=headers,
+        json={"ref": default_branch, "inputs": dispatch_inputs},
+        timeout=15,
+    )
+    if dispatch_response.status_code != 204:
         update_finding_lifecycle(
             finding_id=finding_id,
             database_url=DATABASE_URL,
-            status="RECHECKING",
-            commit_sha=req.commit_sha,
-            tool=req.tool,
-            scope="file" if req.file else "project",
-            message="Verification initiated"
+            status="OPEN",
+            tool=dispatch_inputs["recheck_tool"],
+            scope="file" if dispatch_inputs["recheck_file_path"] else "project",
+            message=f"Targeted GitHub Actions recheck could not be dispatched (HTTP {dispatch_response.status_code})",
         )
-    except Exception as e:
-        print("DB update failed:", e)
-        pass 
-    
-    try:
-        from src.core.recheck import execute_recheck
-        result = execute_recheck(finding_id, req)
-        
-        try:
-            update_finding_lifecycle(
-                finding_id=finding_id,
-                database_url=DATABASE_URL,
-                status=result["status"],
-                commit_sha=req.commit_sha,
-                tool=result["tool"],
-                scope=result["scope"],
-                message=result["message"]
-            )
-        except Exception:
-            pass
-        return result
-    except Exception as e:
-        try:
-            update_finding_lifecycle(
-                finding_id=finding_id,
-                database_url=DATABASE_URL,
-                status="OPEN",
-                message=f"Recheck failed: {str(e)}"
-            )
-        except:
-            pass
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=dispatch_response.status_code if dispatch_response.status_code in (403, 404) else 502,
+            detail={"message": "GitHub Actions targeted recheck dispatch failed.", **_github_api_error_context(dispatch_response)},
+        )
+    return {
+        "finding_id": finding_id,
+        "repository": identity["full_name"],
+        "tool": dispatch_inputs["recheck_tool"],
+        "status": "RECHECKING",
+    }
 
 
 import requests
@@ -586,6 +877,21 @@ def github_select_repo(req: SelectRepoRequest):
     return {"success": True, "selected": req.selected}
 
 
+@app.get("/api/configuration/analysis-services")
+def api_analysis_services_configuration():
+    """Expose configuration metadata without reading or returning credentials."""
+    return {
+        "codex": {
+            "status": "MANAGED_EXTERNALLY",
+            "configuration_source": "GITHUB_ACTIONS_SECRETS",
+            "scope": "PER_REPOSITORY",
+            "credential_input_enabled": False,
+            "credential_update_supported": False,
+            "global_configuration_available": False,
+        }
+    }
+
+
 
 from src.core.onboarding import (
     check_onboarding_status, onboard_repository, compute_diff, EXPECTED_WORKFLOW,
@@ -737,6 +1043,64 @@ def _verify_required_analysis_secret(
     if not supplied or not hmac.compare_digest(str(supplied), str(ANALYSIS_SECRET)):
         raise HTTPException(status_code=403, detail="Invalid analysis authorization secret")
 
+
+@app.post("/api/findings/{finding_id}/recheck-result")
+def api_finding_recheck_result(
+    finding_id: str,
+    req: RecheckResultRequest,
+    authorization: Optional[str] = Header(None),
+    x_analysis_secret: Optional[str] = Header(None),
+    secret: Optional[str] = None,
+):
+    """Accept an authenticated, small result from the GitHub-hosted recheck."""
+    _verify_required_analysis_secret(authorization, x_analysis_secret, secret)
+    try:
+        identity = normalize_github_repository(req.repository)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    tool = str(req.tool or "").strip().lower()
+    status = str(req.status or "").strip().upper()
+    if tool not in SUPPORTED_RECHECK_TOOLS:
+        raise HTTPException(status_code=400, detail="Unsupported recheck tool")
+    if status not in {"FIXED", "STILL_PRESENT", "FAILED"}:
+        raise HTTPException(status_code=400, detail="Invalid targeted recheck result status")
+
+    finding = _finding_for_recheck(identity["full_name"], finding_id)
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding was not found in a completed report for this repository")
+    if not _finding_supports_recheck_tool(finding, tool):
+        raise HTTPException(status_code=400, detail="Recheck tool does not match the selected finding")
+    if str(finding.get("rule_id") or "") != str(req.rule_id or ""):
+        raise HTTPException(status_code=400, detail="Recheck rule ID does not match the selected finding")
+
+    lifecycle = get_finding_lifecycle(finding_id, DATABASE_URL)
+    target_status = status if status in {"FIXED", "STILL_PRESENT"} else "OPEN"
+    if lifecycle.get("status") == target_status and lifecycle.get("verification_tool") == tool:
+        return {"finding_id": finding_id, "status": target_status, "idempotent": True}
+
+    # Callback-provided messages are deliberately not persisted: they could
+    # contain tool output. Store only a safe lifecycle message instead.
+    message = (
+        "Targeted GitHub Actions recheck completed."
+        if status in {"FIXED", "STILL_PRESENT"}
+        else "Targeted GitHub Actions recheck failed or was inconclusive; finding remains open."
+    )
+    update_finding_lifecycle(
+        finding_id=finding_id,
+        database_url=DATABASE_URL,
+        status=target_status,
+        tool=tool,
+        scope="project" if tool == "snyk" else "file",
+        message=message,
+    )
+    return {
+        "finding_id": finding_id,
+        "repository": identity["full_name"],
+        "status": target_status,
+        "recheck_status": status,
+    }
+
 def _github_headers(token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
@@ -792,6 +1156,23 @@ def _download_report_from_artifact(artifact: Dict[str, Any], headers: Dict[str, 
         raise RuntimeError("Artifact report.json does not contain a findings array")
     return report
 
+def _select_matching_github_run(workflow_runs: List[Dict[str, Any]], started_at):
+    import datetime
+
+    # Allow a small clock/timestamp skew between local Postgres reservation time
+    # and GitHub's created_at timestamp. The run is still repository-scoped and
+    # duplicate-run protection allows only one local RUNNING analysis per repo.
+    earliest = None
+    if started_at:
+        earliest = started_at - datetime.timedelta(minutes=5)
+
+    for gh_run in workflow_runs:
+        created_at = _parse_iso_datetime(gh_run.get("created_at"))
+        if earliest and created_at and created_at < earliest:
+            continue
+        return gh_run
+    return None
+
 def _sync_running_analysis_from_github(owner: str, repo: str, current_run: Dict[str, Any]) -> Dict[str, Any]:
     if not current_run or current_run.get("status") != "RUNNING":
         return current_run
@@ -819,18 +1200,29 @@ def _sync_running_analysis_from_github(owner: str, repo: str, current_run: Dict[
         params=params,
         timeout=15,
     )
-    if runs_resp.status_code != 200:
-        print(f"[analysis-sync] workflow run lookup failed run_id={run_id} repository={full_name} github_status={runs_resp.status_code}")
-        return current_run
-
-    workflow_runs = runs_resp.json().get("workflow_runs", [])
     selected_run = None
-    for gh_run in workflow_runs:
-        created_at = _parse_iso_datetime(gh_run.get("created_at"))
-        if started_at and created_at and created_at < started_at:
-            continue
-        selected_run = gh_run
-        break
+    if runs_resp.status_code == 200:
+        selected_run = _select_matching_github_run(
+            runs_resp.json().get("workflow_runs", []),
+            started_at,
+        )
+    else:
+        print(f"[analysis-sync] workflow-specific run lookup failed run_id={run_id} repository={full_name} github_status={runs_resp.status_code}; trying repository run lookup")
+
+    if not selected_run:
+        repo_runs_resp = requests.get(
+            f"https://api.github.com/repos/{full_name}/actions/runs",
+            headers=headers,
+            params=params,
+            timeout=15,
+        )
+        if repo_runs_resp.status_code != 200:
+            print(f"[analysis-sync] repository run lookup failed run_id={run_id} repository={full_name} github_status={repo_runs_resp.status_code}")
+            return current_run
+        selected_run = _select_matching_github_run(
+            repo_runs_resp.json().get("workflow_runs", []),
+            started_at,
+        )
 
     if not selected_run:
         print(f"[analysis-sync] no matching workflow run yet run_id={run_id} repository={full_name}")
@@ -934,6 +1326,10 @@ def api_analysis_report_callback(
         authorization=authorization,
         x_analysis_secret=x_analysis_secret,
         secret=secret,
+    )
+    print(
+        f"[analysis-callback] received run_id={run_id} "
+        f"repository={req.repository} report_exists={bool(req.report)}"
     )
     if req.status and req.status != "COMPLETED":
         raise HTTPException(status_code=400, detail="Report callback only accepts COMPLETED reports")

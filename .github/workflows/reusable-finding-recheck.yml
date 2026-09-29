@@ -1,0 +1,194 @@
+name: Reusable Finding Recheck
+
+on:
+  workflow_call:
+    inputs:
+      finding_id:
+        required: true
+        type: string
+      tool:
+        required: true
+        type: string
+      rule_id:
+        required: true
+        type: string
+      file_path:
+        required: false
+        type: string
+      line_start:
+        required: false
+        type: string
+      line_end:
+        required: false
+        type: string
+      commit_sha:
+        required: false
+        type: string
+    secrets:
+      SNYK_TOKEN:
+        required: false
+      ANALYSIS_BACKEND_URL:
+        required: false
+      ANALYSIS_SECRET:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  recheck:
+    name: Targeted finding recheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Initialise safe result
+        env:
+          FINDING_ID: ${{ inputs.finding_id }}
+          TOOL: ${{ inputs.tool }}
+          RULE_ID: ${{ inputs.rule_id }}
+        run: |
+          python - <<'PY'
+          import json, os
+          with open('recheck-result.json', 'w', encoding='utf-8') as output:
+              json.dump({
+                  'finding_id': os.environ['FINDING_ID'],
+                  'tool': os.environ['TOOL'],
+                  'rule_id': os.environ['RULE_ID'],
+                  'status': 'FAILED',
+              }, output)
+          PY
+
+      - name: Checkout target repository at requested commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.sha }}
+          path: target-repo
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install selected targeted tool
+        env:
+          TOOL: ${{ inputs.tool }}
+        run: |
+          case "$TOOL" in
+            semgrep) python -m pip install --disable-pip-version-check semgrep ;;
+            ruff) python -m pip install --disable-pip-version-check ruff ;;
+            bandit) python -m pip install --disable-pip-version-check bandit ;;
+            deslint) echo "Deslint must be provided by the target repository's Node dependencies." ;;
+            snyk) echo "Snyk has no safe file-level targeted recheck and will be reported as unsupported." ;;
+            *) echo "Unsupported recheck tool"; exit 1 ;;
+          esac
+
+      - name: Run allowlisted targeted recheck
+        id: targeted_recheck
+        env:
+          FINDING_ID: ${{ inputs.finding_id }}
+          TOOL: ${{ inputs.tool }}
+          RULE_ID: ${{ inputs.rule_id }}
+          FILE_PATH: ${{ inputs.file_path }}
+          LINE_START: ${{ inputs.line_start }}
+          LINE_END: ${{ inputs.line_end }}
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import subprocess
+
+          tool = os.environ['TOOL'].strip().lower()
+          rule_id = os.environ['RULE_ID']
+          finding_id = os.environ['FINDING_ID']
+          file_path = os.environ.get('FILE_PATH', '')
+          result = {'finding_id': finding_id, 'tool': tool, 'rule_id': rule_id, 'status': 'FAILED'}
+
+          def save():
+              with open('recheck-result.json', 'w', encoding='utf-8') as output:
+                  json.dump(result, output)
+
+          try:
+              allowed = {'semgrep', 'ruff', 'bandit', 'deslint', 'snyk'}
+              if tool not in allowed:
+                  raise ValueError('unsupported tool')
+              if tool == 'snyk':
+                  # Snyk test is project-level. Do not turn a finding recheck
+                  # into a full dependency scan and accidentally mark it fixed.
+                  raise ValueError('Snyk does not support a safe file-level targeted recheck')
+              path = PurePosixPath(file_path)
+              if not file_path or path.is_absolute() or '..' in path.parts or '\\' in file_path:
+                  raise ValueError('invalid repository-relative file path')
+              target = (Path('target-repo') / path).resolve()
+              root = Path('target-repo').resolve()
+              if root not in target.parents or not target.is_file():
+                  raise ValueError('target file is unavailable')
+
+              commands = {
+                  'semgrep': ['semgrep', 'scan', '--json', '--quiet', str(target)],
+                  'ruff': ['ruff', 'check', '--output-format=json', str(target)],
+                  'bandit': ['bandit', '-f', 'json', '-q', str(target)],
+                  'deslint': ['npx', '--no-install', 'deslint', '--format', 'json', str(target)],
+              }
+              completed = subprocess.run(commands[tool], capture_output=True, text=True, timeout=180)
+              raw = completed.stdout or completed.stderr
+              if not raw.strip():
+                  raise ValueError('tool produced no machine-readable result')
+              parsed = json.loads(raw)
+              if tool == 'semgrep':
+                  matches = [item for item in parsed.get('results', []) if item.get('check_id') == rule_id]
+              elif tool == 'ruff':
+                  matches = [item for item in parsed if item.get('code') == rule_id]
+              elif tool == 'bandit':
+                  matches = [item for item in parsed.get('results', []) if item.get('test_id') == rule_id]
+              else:
+                  records = parsed if isinstance(parsed, list) else parsed.get('results', [])
+                  matches = [item for item in records if item.get('ruleId') == rule_id]
+              if completed.returncode not in (0, 1):
+                  raise ValueError('tool did not complete successfully')
+              result['status'] = 'STILL_PRESENT' if matches else 'FIXED'
+          except Exception:
+              # Details are intentionally not included in the callback; tool
+              # output can contain source code or credentials.
+              result['status'] = 'FAILED'
+          finally:
+              save()
+          PY
+
+      - name: Send targeted result to backend
+        if: always()
+        env:
+          ANALYSIS_BACKEND_URL: ${{ secrets.ANALYSIS_BACKEND_URL }}
+          ANALYSIS_SECRET: ${{ secrets.ANALYSIS_SECRET }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.error, urllib.request
+          if not os.environ.get('ANALYSIS_BACKEND_URL') or not os.environ.get('ANALYSIS_SECRET'):
+              print('[recheck-callback] backend callback is not configured; artifact remains available.')
+              raise SystemExit(0)
+          with open('recheck-result.json', encoding='utf-8') as input_file:
+              payload = json.load(input_file)
+          payload['repository'] = os.environ['REPOSITORY']
+          payload['workflow_run_id'] = os.environ['WORKFLOW_RUN_ID']
+          url = os.environ['ANALYSIS_BACKEND_URL'].rstrip('/') + '/api/findings/' + payload['finding_id'] + '/recheck-result'
+          request = urllib.request.Request(
+              url, data=json.dumps(payload).encode('utf-8'), method='POST',
+              headers={'Authorization': 'Bearer ' + os.environ['ANALYSIS_SECRET'], 'Content-Type': 'application/json'},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  print(f"[recheck-callback] backend accepted result status={response.status}")
+          except Exception:
+              print('[recheck-callback] backend callback unavailable; artifact remains available.')
+          PY
+
+      - name: Upload targeted recheck result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finding-recheck-${{ inputs.finding_id }}-${{ github.run_id }}
+          path: recheck-result.json
+          if-no-files-found: warn
+          retention-days: 30

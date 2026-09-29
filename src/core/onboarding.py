@@ -15,9 +15,32 @@ on:
         description: 'Analysis Run ID'
         required: false
         type: string
+      recheck_finding_id:
+        description: 'Finding ID for a targeted recheck'
+        required: false
+        type: string
+      recheck_tool:
+        required: false
+        type: string
+      recheck_rule_id:
+        required: false
+        type: string
+      recheck_file_path:
+        required: false
+        type: string
+      recheck_line_start:
+        required: false
+        type: string
+      recheck_line_end:
+        required: false
+        type: string
+      recheck_commit_sha:
+        required: false
+        type: string
 
 jobs:
   analysis:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.recheck_finding_id == '' }}
     uses: manasvipaweria/repo-analysis/.github/workflows/reusable-analysis.yml@main
     with:
       enable_codex: true
@@ -28,6 +51,21 @@ jobs:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANALYSIS_BACKEND_URL: ${{ secrets.ANALYSIS_BACKEND_URL }}
+      ANALYSIS_SECRET: ${{ secrets.ANALYSIS_SECRET }}
+  recheck:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.recheck_finding_id != '' }}
+    uses: manasvipaweria/repo-analysis/.github/workflows/reusable-finding-recheck.yml@main
+    with:
+      finding_id: ${{ inputs.recheck_finding_id }}
+      tool: ${{ inputs.recheck_tool }}
+      rule_id: ${{ inputs.recheck_rule_id }}
+      file_path: ${{ inputs.recheck_file_path }}
+      line_start: ${{ inputs.recheck_line_start }}
+      line_end: ${{ inputs.recheck_line_end }}
+      commit_sha: ${{ inputs.recheck_commit_sha }}
+    secrets:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
       ANALYSIS_BACKEND_URL: ${{ secrets.ANALYSIS_BACKEND_URL }}
       ANALYSIS_SECRET: ${{ secrets.ANALYSIS_SECRET }}
 """
