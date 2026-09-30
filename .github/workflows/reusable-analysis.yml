@@ -124,7 +124,6 @@ jobs:
           npm install -g \
             snyk \
             @cyclonedx/cdxgen \
-            @owasp/dep-scan \
             dependency-cruiser \
             react-doctor
 
