@@ -693,7 +693,7 @@ def recheck_finding(finding_id: str, req: RecheckRequest):
 import requests
 from src.storage.postgres import (
     get_github_connection, save_github_connection, delete_github_connection,
-    get_managed_repos, set_managed_repo
+    get_managed_repos, get_repo_onboarding, set_managed_repo
 )
 
 class ConnectRequest(BaseModel):
@@ -705,6 +705,21 @@ class SelectRepoRequest(BaseModel):
     name: str
     selected: bool
 
+
+class BulkOnboardRepository(BaseModel):
+    owner: str
+    name: str
+
+
+class BulkOnboardRequest(BaseModel):
+    repositories: List[BulkOnboardRepository]
+
+
+class RepositorySecretRequest(BaseModel):
+    secret_value: str
+    replace_existing: bool = False
+    replace_repositories: List[str] = []
+
 SAFE_GITHUB_RESPONSE_HEADERS = (
     "X-Accepted-GitHub-Permissions",
     "X-OAuth-Scopes",
@@ -715,6 +730,8 @@ SAFE_GITHUB_RESPONSE_HEADERS = (
 )
 
 WORKFLOW_FILE_NAME = "code-analysis.yml"
+GITHUB_SECRET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ONBOARDED_SECRET_STATUSES = frozenset({"UP_TO_DATE", "DRIFT"})
 
 def _redact_secret(value: Any) -> Any:
     if isinstance(value, dict):
@@ -760,6 +777,149 @@ def _github_api_error_context(response: requests.Response) -> Dict[str, Any]:
 def _github_error_message(response: requests.Response) -> str:
     body = _safe_response_body(response)
     return str(body.get("message") or body.get("body") or "No message provided by GitHub")
+
+
+def _normalize_github_secret_name(secret_name: str) -> str:
+    """Validate and normalize a repository Actions secret name before GitHub calls."""
+    normalized = str(secret_name or "").strip().upper()
+    if not GITHUB_SECRET_NAME_RE.fullmatch(normalized):
+        raise ValueError("Secret names may contain only letters, numbers, and underscores, and cannot start with a number")
+    if normalized.startswith("GITHUB_"):
+        raise ValueError("Secret names cannot start with GITHUB_")
+    return normalized
+
+
+def _github_secret_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Repo-Analysis-Orchestrator",
+    }
+
+
+def _encrypt_github_actions_secret(public_key: str, secret_value: str) -> str:
+    """Return GitHub's required LibSodium sealed-box representation of a secret.
+
+    The plaintext is only held in the request and this function's local memory.
+    """
+    try:
+        from nacl.public import PublicKey, SealedBox
+        key = PublicKey(base64.b64decode(public_key))
+        encrypted = SealedBox(key).encrypt(secret_value.encode("utf-8"))
+        return base64.b64encode(encrypted).decode("ascii")
+    except Exception as exc:
+        raise RuntimeError("Could not encrypt the repository secret") from exc
+
+
+def _safe_secret_error(response: requests.Response, secret_value: str) -> str:
+    """Return a diagnostic that cannot echo plaintext supplied by the client."""
+    message = _github_error_message(response)
+    if secret_value:
+        message = message.replace(secret_value, "[REDACTED]")
+    return f"GitHub returned {response.status_code}: {message}"
+
+
+def _configure_repository_secret(identity: Dict[str, str], secret_name: str, secret_value: str, token: str) -> Dict[str, str]:
+    """Set one repository Actions secret; callers deliberately continue after failures."""
+    base_url = f"https://api.github.com/repos/{identity['full_name']}/actions/secrets"
+    headers = _github_secret_headers(token)
+    try:
+        key_response = requests.get(f"{base_url}/public-key", headers=headers, timeout=15)
+    except requests.RequestException:
+        return {"repository": identity["full_name"], "status": "rejected", "reason": "GitHub public-key request failed"}
+    if key_response.status_code != 200:
+        return {
+            "repository": identity["full_name"],
+            "status": "rejected",
+            "reason": _safe_secret_error(key_response, secret_value),
+        }
+    try:
+        public_key_data = key_response.json()
+        encrypted_value = _encrypt_github_actions_secret(public_key_data["key"], secret_value)
+        key_id = str(public_key_data["key_id"])
+    except (KeyError, TypeError, ValueError, RuntimeError):
+        return {"repository": identity["full_name"], "status": "rejected", "reason": "Could not encrypt the repository secret"}
+    try:
+        write_response = requests.put(
+            f"{base_url}/{secret_name}",
+            headers=headers,
+            json={"encrypted_value": encrypted_value, "key_id": key_id},
+            timeout=15,
+        )
+    except requests.RequestException:
+        return {"repository": identity["full_name"], "status": "rejected", "reason": "GitHub secret update request failed"}
+    if write_response.status_code not in (201, 204):
+        return {
+            "repository": identity["full_name"],
+            "status": "rejected",
+            "reason": _safe_secret_error(write_response, secret_value),
+        }
+    return {"repository": identity["full_name"], "status": "configured"}
+
+
+def _repository_secret_metadata(
+    identity: Dict[str, str], secret_name: str, token: str, secret_value: str = ""
+) -> Dict[str, str]:
+    """Read repository-secret metadata only; GitHub never exposes values."""
+    try:
+        response = requests.get(
+            f"https://api.github.com/repos/{identity['full_name']}/actions/secrets/{secret_name}",
+            headers=_github_secret_headers(token),
+            timeout=15,
+        )
+    except requests.RequestException:
+        return {"name": secret_name, "status": "INACCESSIBLE", "reason": "GitHub secret metadata request failed"}
+    if response.status_code == 200:
+        return {"name": secret_name, "status": "CONFIGURED"}
+    if response.status_code == 404:
+        return {"name": secret_name, "status": "MISSING"}
+    reason = _github_error_message(response)
+    if secret_value:
+        reason = reason.replace(secret_value, "[REDACTED]")
+    return {
+        "name": secret_name,
+        "status": "INACCESSIBLE",
+        "reason": f"GitHub returned {response.status_code}: {reason}",
+    }
+
+
+def _safe_secret_metadata_result(identity: Dict[str, str], secret_name: str, token: str) -> Dict[str, str]:
+    metadata = _repository_secret_metadata(identity, secret_name, token)
+    return {"repository": identity["full_name"], **metadata}
+
+
+def _required_repository_secret_statuses(identity: Dict[str, str], token: str, required_names: List[str]) -> List[Dict[str, str]]:
+    return [_repository_secret_metadata(identity, secret_name, token) for secret_name in required_names]
+
+
+def _onboarding_overall_status(workflow_status: str, secrets: List[Dict[str, str]]) -> str:
+    if workflow_status == "ERROR":
+        return "WORKFLOW_FAILED"
+    if any(secret["status"] != "CONFIGURED" for secret in secrets):
+        return "NEEDS_CONFIGURATION"
+    return "READY" if workflow_status == "UP_TO_DATE" else "WORKFLOW_PENDING"
+
+
+def _require_repository_secret_value(req: RepositorySecretRequest) -> str:
+    value = str(req.secret_value or "")
+    if not value:
+        raise HTTPException(status_code=400, detail="Secret value is required")
+    return value
+
+
+def _onboarded_secret_repositories() -> List[Dict[str, str]]:
+    """Resolve only repositories known to this system and already onboarded."""
+    targets = []
+    for managed in get_managed_repos(DATABASE_URL):
+        onboarding = get_repo_onboarding(DATABASE_URL, managed["full_name"])
+        if not onboarding or onboarding.get("status") not in ONBOARDED_SECRET_STATUSES:
+            continue
+        try:
+            targets.append(normalize_github_repository(managed["full_name"]))
+        except ValueError:
+            continue
+    return targets
 
 def _validate_github_token(token: str):
     headers = {
@@ -885,6 +1045,109 @@ def github_select_repo(req: SelectRepoRequest):
     return {"success": True, "selected": req.selected}
 
 
+@app.put("/api/repositories/{owner}/{repo}/secrets/{secret_name}")
+def put_repository_secret(owner: str, repo: str, secret_name: str, req: RepositorySecretRequest):
+    """Create a missing secret or explicitly replace an existing one."""
+    try:
+        identity = normalize_github_repository(owner=owner, name=repo)
+        normalized_name = _normalize_github_secret_name(secret_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    secret_value = _require_repository_secret_value(req)
+    connection = get_github_connection(DATABASE_URL)
+    if not connection:
+        raise HTTPException(status_code=401, detail="GitHub not connected")
+    metadata = _repository_secret_metadata(identity, normalized_name, connection["token"], secret_value)
+    if metadata["status"] == "CONFIGURED" and not req.replace_existing:
+        result = {"repository": identity["full_name"], "status": "kept"}
+    elif metadata["status"] == "INACCESSIBLE":
+        result = {"repository": identity["full_name"], "status": "rejected", "reason": metadata.get("reason", "Secret metadata is inaccessible")}
+    else:
+        result = _configure_repository_secret(identity, normalized_name, secret_value, connection["token"])
+    return {
+        "secret_name": normalized_name,
+        "configured_count": int(result["status"] == "configured"),
+        "kept_count": int(result["status"] == "kept"),
+        "rejected_count": int(result["status"] == "rejected"),
+        "results": [result],
+    }
+
+
+@app.put("/api/repositories/secrets/{secret_name}/apply")
+def put_secret_for_all_onboarded_repositories(secret_name: str, req: RepositorySecretRequest):
+    """Apply a secret independently to each system-known onboarded repository."""
+    try:
+        normalized_name = _normalize_github_secret_name(secret_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    secret_value = _require_repository_secret_value(req)
+    connection = get_github_connection(DATABASE_URL)
+    if not connection:
+        raise HTTPException(status_code=401, detail="GitHub not connected")
+    targets = _onboarded_secret_repositories()
+    if not targets:
+        raise HTTPException(status_code=400, detail="No onboarded repositories are available for this secret")
+    explicit_replacements = set()
+    try:
+        explicit_replacements = {
+            normalize_github_repository(repository).get("full_name")
+            for repository in req.replace_repositories
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    results = []
+    for identity in targets:
+        metadata = _repository_secret_metadata(identity, normalized_name, connection["token"], secret_value)
+        if metadata["status"] == "CONFIGURED" and not (
+            req.replace_existing and identity["full_name"] in explicit_replacements
+        ):
+            results.append({"repository": identity["full_name"], "status": "kept"})
+        elif metadata["status"] == "INACCESSIBLE":
+            results.append({"repository": identity["full_name"], "status": "rejected", "reason": metadata.get("reason", "Secret metadata is inaccessible")})
+        else:
+            results.append(_configure_repository_secret(identity, normalized_name, secret_value, connection["token"]))
+    return {
+        "secret_name": normalized_name,
+        "configured_count": sum(result["status"] == "configured" for result in results),
+        "kept_count": sum(result["status"] == "kept" for result in results),
+        "rejected_count": sum(result["status"] == "rejected" for result in results),
+        "results": results,
+    }
+
+
+@app.get("/api/repositories/{owner}/{repo}/secrets/{secret_name}/status")
+def get_repository_secret_status(owner: str, repo: str, secret_name: str):
+    """Return Actions secret metadata state only; GitHub never returns the value."""
+    try:
+        identity = normalize_github_repository(owner=owner, name=repo)
+        normalized_name = _normalize_github_secret_name(secret_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    connection = get_github_connection(DATABASE_URL)
+    if not connection:
+        raise HTTPException(status_code=401, detail="GitHub not connected")
+    metadata = _repository_secret_metadata(identity, normalized_name, connection["token"])
+    status_map = {"CONFIGURED": "configured", "MISSING": "not_configured", "INACCESSIBLE": "inaccessible"}
+    return {"repository": identity["full_name"], "secret_name": normalized_name, "status": status_map[metadata["status"]]}
+
+
+@app.get("/api/repositories/secrets/{secret_name}/statuses")
+def get_onboarded_repository_secret_statuses(secret_name: str):
+    """Return safe metadata states for one secret across system-known onboarded repositories."""
+    try:
+        normalized_name = _normalize_github_secret_name(secret_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    connection = get_github_connection(DATABASE_URL)
+    if not connection:
+        raise HTTPException(status_code=401, detail="GitHub not connected")
+    targets = _onboarded_secret_repositories()
+    return {
+        "secret_name": normalized_name,
+        "results": [_safe_secret_metadata_result(identity, normalized_name, connection["token"]) for identity in targets],
+    }
+
+
 @app.get("/api/configuration/analysis-services")
 def api_analysis_services_configuration():
     """Expose configuration metadata without reading or returning credentials."""
@@ -903,9 +1166,29 @@ def api_analysis_services_configuration():
 
 from src.core.onboarding import (
     check_onboarding_status, onboard_repository, compute_diff, EXPECTED_WORKFLOW,
-    WORKFLOW_PATH
+    WORKFLOW_PATH, required_analysis_secrets
 )
 from src.storage.postgres import save_repo_onboarding, get_repo_onboarding
+
+
+def _onboard_repository_with_secret_check(connection: Dict[str, Any], owner: str, repo: str) -> Dict[str, Any]:
+    """Perform workflow onboarding and non-mutating required-secret checks."""
+    full_name = f"{owner}/{repo}"
+    workflow_status, workflow_details = check_onboarding_status(connection["token"], owner, repo)
+    secret_states: List[Dict[str, str]] = []
+    if workflow_status != "ERROR":
+        identity = normalize_github_repository(owner=owner, name=repo)
+        secret_states = _required_repository_secret_statuses(
+            identity, connection["token"], required_analysis_secrets()
+        )
+    result = onboard_repository(
+        connection["token"], owner, repo, preflight=(workflow_status, workflow_details)
+    )
+    result["repository"] = result.get("repository", full_name)
+    result["workflow"] = {"status": result.get("status")}
+    result["secrets"] = secret_states
+    result["overall_status"] = _onboarding_overall_status(result.get("status", "ERROR"), secret_states)
+    return result
 
 @app.get("/api/github/repos/{owner}/{repo}/onboarding-status")
 def api_onboarding_status(owner: str, repo: str):
@@ -938,11 +1221,14 @@ def api_onboard_repo(owner: str, repo: str):
     conn = get_github_connection(DATABASE_URL)
     if not conn:
         raise HTTPException(status_code=401, detail="GitHub not connected")
-        
-    result = onboard_repository(conn["token"], owner, repo)
+
+    result = _onboard_repository_with_secret_check(conn, owner, repo)
     
     if result.get("status") == "ERROR":
-        raise HTTPException(status_code=500, detail=result.get("detail", "Onboarding failed"))
+        detail = result.get("detail", "Onboarding failed")
+        if isinstance(detail, dict):
+            detail = {**detail, "workflow": result["workflow"], "secrets": result["secrets"], "overall_status": result["overall_status"]}
+        raise HTTPException(status_code=500, detail=detail)
         
     save_repo_onboarding(
         DATABASE_URL,
@@ -954,6 +1240,39 @@ def api_onboard_repo(owner: str, repo: str):
     )
     
     return result
+
+
+@app.post("/api/github/repos/onboard/bulk")
+def api_onboard_repositories_bulk(req: BulkOnboardRequest):
+    """Onboard each requested repository independently; one failure never aborts peers."""
+    conn = get_github_connection(DATABASE_URL)
+    if not conn:
+        raise HTTPException(status_code=401, detail="GitHub not connected")
+    results = []
+    for target in req.repositories:
+        try:
+            identity = normalize_github_repository(owner=target.owner, name=target.name)
+            result = _onboard_repository_with_secret_check(conn, identity["owner"], identity["name"])
+            if result.get("status") != "ERROR":
+                save_repo_onboarding(
+                    DATABASE_URL,
+                    full_name=identity["full_name"],
+                    status=result["status"],
+                    branch_name=result.get("branch"),
+                    pr_number=result.get("pr_number"),
+                    pr_url=result.get("pr_url"),
+                )
+            results.append(result)
+        except Exception:
+            results.append({
+                "repository": f"{target.owner}/{target.name}",
+                "status": "ERROR",
+                "workflow": {"status": "ERROR"},
+                "secrets": [],
+                "overall_status": "WORKFLOW_FAILED",
+                "detail": "Repository onboarding could not be completed",
+            })
+    return {"results": results}
 
 @app.get("/api/github/repos/{owner}/{repo}/onboarding-diff")
 def api_onboarding_diff(owner: str, repo: str):

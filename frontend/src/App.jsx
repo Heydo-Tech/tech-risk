@@ -75,6 +75,18 @@ function severityTone(severity) {
   return 'neutral';
 }
 
+function onboardingStatusLabel(status) {
+  const labels = {
+    UP_TO_DATE: '✓ Configured',
+    ONBOARDING_PR_OPEN: '✓ Update PR created',
+    READY: 'Ready',
+    NEEDS_CONFIGURATION: 'Needs configuration',
+    WORKFLOW_PENDING: 'Workflow pending',
+    WORKFLOW_FAILED: 'Workflow update failed',
+  };
+  return labels[status] || status || 'Pending';
+}
+
 function Breadcrumbs({ items }) {
   return (
     <div className="breadcrumbs">
@@ -231,20 +243,35 @@ function FindingDetail({ finding, repository, branch, commitSha, toolLabel, onCl
 
 function SetupView() {
   const [status, setStatus] = useState(null);
-  const [analysisServices, setAnalysisServices] = useState(null);
+  const [repositories, setRepositories] = useState([]);
   const [token, setToken] = useState('');
+  const [secretName, setSecretName] = useState('');
+  const [secretValue, setSecretValue] = useState('');
+  const [secretScope, setSecretScope] = useState('current');
+  const [currentRepository, setCurrentRepository] = useState('');
+  const [secretResult, setSecretResult] = useState(null);
+  const [secretMetadata, setSecretMetadata] = useState(null);
+  const [secretMetadataLoading, setSecretMetadataLoading] = useState(false);
+  const [secretNotice, setSecretNotice] = useState('');
+  const [replaceDialog, setReplaceDialog] = useState(null);
+  const [replacementValue, setReplacementValue] = useState('');
   const [busy, setBusy] = useState(true);
   const [message, setMessage] = useState('');
 
   const load = async () => {
     setBusy(true);
     try {
-      const [githubStatus, servicesStatus] = await Promise.all([
-        api('/github/status'),
-        api('/configuration/analysis-services'),
-      ]);
+      const githubStatus = await api('/github/status');
       setStatus(githubStatus);
-      setAnalysisServices(servicesStatus);
+      if (githubStatus.connected) {
+        const result = await api('/github/repos');
+        const available = result.repositories || [];
+        setRepositories(available);
+        setCurrentRepository(previous => previous || available.find(repo => repo.selected)?.full_name || available[0]?.full_name || '');
+      } else {
+        setRepositories([]);
+        setCurrentRepository('');
+      }
     }
     catch (err) { setMessage(err.message); }
     finally { setBusy(false); }
@@ -270,6 +297,65 @@ function SetupView() {
     await api('/github/disconnect', { method: 'POST' });
     await load();
   };
+  const normalizedSecretName = () => secretName.trim().toUpperCase();
+  const validSecretName = name => /^[A-Z_][A-Z0-9_]*$/.test(name) && !name.startsWith('GITHUB_');
+  const selectedRepository = () => repositories.find(repo => repo.full_name === currentRepository);
+  const clearSecretDecision = () => { setSecretMetadata(null); setSecretNotice(''); setSecretResult(null); };
+  const checkSecretStatus = async () => {
+    const normalizedName = normalizedSecretName();
+    const selected = selectedRepository();
+    if (!validSecretName(normalizedName)) { setMessage('Enter a valid secret name before checking status.'); return; }
+    if (secretScope === 'current' && !selected) { setMessage('Select a repository before checking secret status.'); return; }
+    setSecretMetadataLoading(true); setMessage(''); setSecretNotice('');
+    try {
+      const result = secretScope === 'all'
+        ? await api(`/repositories/secrets/${encodeURIComponent(normalizedName)}/statuses`)
+        : await api(`/repositories/${encodeURIComponent(selected.owner)}/${encodeURIComponent(selected.name)}/secrets/${encodeURIComponent(normalizedName)}/status`);
+      const results = secretScope === 'all' ? result.results || [] : [{ repository: selected.full_name, status: String(result.status || 'inaccessible').toUpperCase(), secret_name: normalizedName }];
+      setSecretMetadata({ secret_name: normalizedName, results });
+      setSecretName(normalizedName);
+    } catch (err) { setMessage(err.message); }
+    finally { setSecretMetadataLoading(false); }
+  };
+  const saveRepositorySecret = async () => {
+    const normalizedName = normalizedSecretName();
+    if (!validSecretName(normalizedName)) {
+      setMessage('Secret names may contain only letters, numbers, and underscores, cannot start with a number, and cannot start with GITHUB_.');
+      return;
+    }
+    if (!secretValue) { setMessage('Secret value is required.'); return; }
+    const selected = selectedRepository();
+    if (secretScope === 'current' && !selected) { setMessage('Select a repository before saving a repository secret.'); return; }
+    setBusy(true); setMessage(''); setSecretResult(null);
+    try {
+      const path = secretScope === 'all'
+        ? `/repositories/secrets/${encodeURIComponent(normalizedName)}/apply`
+        : `/repositories/${encodeURIComponent(selected.owner)}/${encodeURIComponent(selected.name)}/secrets/${encodeURIComponent(normalizedName)}`;
+      const result = await api(path, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ secret_value: secretValue, replace_existing: false }) });
+      setSecretValue('');
+      setSecretName(normalizedName);
+      setSecretResult(result);
+      await checkSecretStatus();
+    } catch (err) { setMessage(err.message); }
+    finally { setSecretValue(''); setBusy(false); }
+  };
+  const keepExistingSecret = repository => {
+    setSecretNotice(`Existing ${normalizedSecretName()} secret will be kept for ${repository}.`);
+  };
+  const replaceExistingSecret = async () => {
+    if (!replacementValue || !replaceDialog) return;
+    setBusy(true); setMessage('');
+    try {
+      const result = await api(`/repositories/${encodeURIComponent(replaceDialog.owner)}/${encodeURIComponent(replaceDialog.name)}/secrets/${encodeURIComponent(replaceDialog.secretName)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ secret_value: replacementValue, replace_existing: true }),
+      });
+      setReplacementValue('');
+      setReplaceDialog(null);
+      setSecretResult({ ...result, replacement_success: replaceDialog.repository });
+      await checkSecretStatus();
+    } catch (err) { setMessage(err.message); }
+    finally { setReplacementValue(''); setBusy(false); }
+  };
 
   if (busy && !status) return <div className="empty-state">Loading setup…</div>;
   return (
@@ -286,16 +372,22 @@ function SetupView() {
           <p className="security-note">The raw token is sent only to the backend and is never displayed or stored in browser storage.</p>
         </div>
         <div className="panel settings-card">
-          <div className="settings-title"><Activity /><div><h3>Codex &amp; Analysis Services</h3><p>Codex is currently configured through GitHub Actions secrets in each repository.</p></div><Pill tone="neutral">Per repository</Pill></div>
-          <dl className="configuration-facts">
-            <div><dt>Current scope</dt><dd>{analysisServices?.codex?.scope === 'PER_REPOSITORY' ? 'Per repository' : 'Unavailable'}</dd></div>
-            <div><dt>Credential source</dt><dd>{analysisServices?.codex?.configuration_source === 'GITHUB_ACTIONS_SECRETS' ? 'GitHub Actions secrets' : 'Unavailable'}</dd></div>
-            <div><dt>Settings access</dt><dd>Status only</dd></div>
-          </dl>
-          <p className="security-note">This page does not read, expose, request, or update the Codex credential. A future global configuration can replace the current per-repository model without exposing raw secrets to the frontend.</p>
+          <div className="settings-title"><Settings2 /><div><h3>Repository Secrets</h3><p>Set GitHub Actions secrets at repository scope using the existing backend GitHub connection.</p></div><Pill tone="neutral">Per repository</Pill></div>
+          <div className="secret-form">
+            <label>Secret name<input value={secretName} onChange={event => { setSecretName(event.target.value); clearSecretDecision(); }} placeholder="GEMINI_API_KEY" autoComplete="off" /></label>
+            <fieldset className="secret-scope"><legend>Apply to</legend><label><input type="radio" name="secret-scope" checked={secretScope === 'current'} onChange={() => { setSecretScope('current'); clearSecretDecision(); }} /> Current repository</label><label><input type="radio" name="secret-scope" checked={secretScope === 'all'} onChange={() => { setSecretScope('all'); clearSecretDecision(); }} /> All onboarded repositories</label></fieldset>
+            {secretScope === 'current' && <label>Repository<select value={currentRepository} onChange={event => { setCurrentRepository(event.target.value); clearSecretDecision(); }}><option value="">Select a repository</option>{repositories.map(repo => <option key={repo.full_name} value={repo.full_name}>{repo.full_name}</option>)}</select></label>}
+            <div className="button-row"><button className="outline" onClick={checkSecretStatus} disabled={busy || secretMetadataLoading || !status?.connected || !secretName || (secretScope === 'current' && !currentRepository)}>{secretMetadataLoading ? 'Checking…' : 'Check secret status'}</button></div>
+            {secretMetadata && <div className="secret-status-list">{secretMetadata.results.map(item => { const configured = String(item.status).toUpperCase() === 'CONFIGURED'; const repository = repositories.find(repo => repo.full_name === item.repository); return <div className="secret-status" key={item.repository}><div><strong>{item.repository}</strong><Pill tone={configured ? 'success' : String(item.status).toUpperCase() === 'MISSING' || String(item.status).toUpperCase() === 'NOT_CONFIGURED' ? 'warning' : 'danger'}>{configured ? '● Configured' : String(item.status).toUpperCase() === 'MISSING' || String(item.status).toUpperCase() === 'NOT_CONFIGURED' ? '⚠ Missing' : '⚠ Unable to verify'}</Pill>{item.reason && <small>{item.reason}</small>}</div>{configured && repository && <div className="button-row"><button className="outline" onClick={() => keepExistingSecret(item.repository)}>Keep Existing</button><button className="primary" onClick={() => setReplaceDialog({ repository: item.repository, owner: repository.owner, name: repository.name, secretName: secretMetadata.secret_name })}>Replace</button></div>}</div>; })}</div>}
+            {secretMetadata && secretMetadata.results.some(item => !['CONFIGURED'].includes(String(item.status).toUpperCase())) && <><label>Secret value<input type="password" value={secretValue} onChange={event => setSecretValue(event.target.value)} placeholder="Enter a new value for missing secrets" autoComplete="new-password" /></label><div className="button-row"><button className="primary" onClick={saveRepositorySecret} disabled={busy || !secretValue}>Configure missing secrets</button></div></>}
+          </div>
+          <p className="security-note">Secret values are sent only to the backend for encryption and GitHub upload. Existing values cannot be displayed or retrieved.</p>
+          {secretNotice && <p className="security-note">✓ {secretNotice}</p>}
+          {secretResult && <div className="secret-results"><p><strong>Secret: {secretResult.secret_name}</strong></p>{secretResult.replacement_success && <p>✓ Secret replaced successfully for {secretResult.replacement_success}.</p>}<p>{secretResult.configured_count} configured · {secretResult.kept_count || 0} kept · {secretResult.rejected_count} rejected</p>{(secretResult.results || []).map(result => <div className={`secret-result ${result.status}`} key={result.repository}><strong>{result.status === 'configured' ? '✓' : result.status === 'kept' ? '✓' : '✗'} {result.repository}</strong>{result.status === 'kept' && <small>Existing secret kept</small>}{result.reason && <small>Rejected — {result.reason}</small>}</div>)}</div>}
         </div>
       </div>
       {message && <div className="callout"><Activity /><p>{message}</p></div>}
+      {replaceDialog && <div className="finding-modal-overlay centered"><div className="diff-modal replace-secret-modal"><div className="detail-head"><h3>Replace {replaceDialog.secretName}</h3><button className="icon-btn small" onClick={() => { setReplacementValue(''); setReplaceDialog(null); }}><X /></button></div><p>This secret is already configured. The existing GitHub Actions secret cannot be viewed or recovered. Entering a new value will replace it.</p><label className="replace-secret-value">New secret value<input type="password" value={replacementValue} onChange={event => setReplacementValue(event.target.value)} autoComplete="new-password" /></label><div className="detail-actions"><button className="outline" onClick={() => { setReplacementValue(''); setReplaceDialog(null); }}>Cancel</button><button className="primary" disabled={busy || !replacementValue} onClick={replaceExistingSecret}>Replace Secret</button></div></div></div>}
     </section>
   );
 }
@@ -310,6 +402,9 @@ function RepositoriesView({ onOpenRepository, onOpenSettings }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [diff, setDiff] = useState(null);
+  const [onboardingResult, setOnboardingResult] = useState(null);
+  const [onboardingReplace, setOnboardingReplace] = useState(null);
+  const [onboardingReplacementValue, setOnboardingReplacementValue] = useState('');
 
   const loadRepoState = async repo => {
     const [ob, run] = await Promise.all([api(`/github/repos/${repo.owner}/${repo.name}/onboarding-status`), api(`/github/repos/${repo.owner}/${repo.name}/current-run`)]);
@@ -339,7 +434,7 @@ function RepositoriesView({ onOpenRepository, onOpenSettings }) {
 
   const act = async (repo, action) => {
     setBusy(prev => ({ ...prev, [repo.full_name]: true })); setError('');
-    try { await action(); await loadRepoState(repo); }
+    try { const result = await action(); await loadRepoState(repo); return result; }
     catch (err) { setError(`${repo.full_name}: ${err.message}`); }
     finally { setBusy(prev => ({ ...prev, [repo.full_name]: false })); }
   };
@@ -347,7 +442,11 @@ function RepositoriesView({ onOpenRepository, onOpenSettings }) {
     await api('/github/repos/select', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ full_name: repo.full_name, owner: repo.owner, name: repo.name, selected }) });
     setRepos(current => current.map(item => item.full_name === repo.full_name ? { ...item, selected } : item));
   });
-  const onboard = repo => act(repo, () => api(`/github/repos/${repo.owner}/${repo.name}/onboard`, { method: 'POST' }));
+  const onboard = repo => act(repo, async () => {
+    const result = await api(`/github/repos/${repo.owner}/${repo.name}/onboard`, { method: 'POST' });
+    setOnboardingResult({ repo, ...result });
+    return result;
+  });
   const run = repo => act(repo, () => api(`/github/repos/${repo.owner}/${repo.name}/run-analysis`, { method: 'POST' }));
   const viewDiff = async repo => { try { setDiff({ repo, ...(await api(`/github/repos/${repo.owner}/${repo.name}/onboarding-diff`)) }); } catch (err) { setError(err.message); } };
   const updateDriftedWorkflow = async () => {
@@ -356,7 +455,8 @@ function RepositoriesView({ onOpenRepository, onOpenSettings }) {
     setBusy(prev => ({ ...prev, [repo.full_name]: true }));
     setError('');
     try {
-      await api(`/github/repos/${repo.owner}/${repo.name}/onboard`, { method: 'POST' });
+      const result = await api(`/github/repos/${repo.owner}/${repo.name}/onboard`, { method: 'POST' });
+      setOnboardingResult({ repo, ...result });
       setDiff(null);
       await loadRepoState(repo);
     } catch (err) {
@@ -364,6 +464,28 @@ function RepositoriesView({ onOpenRepository, onOpenSettings }) {
     } finally {
       setBusy(prev => ({ ...prev, [repo.full_name]: false }));
     }
+  };
+  const keepOnboardingSecret = secretName => {
+    setOnboardingResult(current => current ? {
+      ...current,
+      secrets: (current.secrets || []).map(secret => secret.name === secretName ? { ...secret, kept: true } : secret),
+    } : current);
+  };
+  const replaceOnboardingSecret = async () => {
+    if (!onboardingReplace || !onboardingReplacementValue) return;
+    const { repo, secretName } = onboardingReplace;
+    setBusy(previous => ({ ...previous, [repo.full_name]: true })); setError('');
+    try {
+      await api(`/repositories/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.name)}/secrets/${encodeURIComponent(secretName)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ secret_value: onboardingReplacementValue, replace_existing: true }),
+      });
+      setOnboardingResult(current => current ? {
+        ...current,
+        secrets: (current.secrets || []).map(secret => secret.name === secretName ? { ...secret, status: 'CONFIGURED', replaced: true, reason: undefined } : secret),
+      } : current);
+      setOnboardingReplace(null);
+    } catch (err) { setError(`${repo.full_name}: ${err.message}`); }
+    finally { setOnboardingReplacementValue(''); setBusy(previous => ({ ...previous, [repo.full_name]: false })); }
   };
 
   const filtered = repos.filter(repo => repo.full_name.toLowerCase().includes(search.toLowerCase()));
@@ -396,13 +518,18 @@ function RepositoriesView({ onOpenRepository, onOpenSettings }) {
         })}
       </div>
       {diff && <div className="finding-modal-overlay centered"><div className="diff-modal"><div className="detail-head"><h3>Workflow drift: {diff.repo.full_name}</h3><button className="icon-btn small" onClick={() => setDiff(null)}><X /></button></div><pre><code>{diff.diff || 'No diff output.'}</code></pre><div className="detail-actions actions"><button className="outline" disabled={busy[diff.repo.full_name]} onClick={() => setDiff(null)}>Cancel</button><button className="primary" disabled={busy[diff.repo.full_name]} onClick={updateDriftedWorkflow}>{busy[diff.repo.full_name] ? 'Creating update PR…' : 'Update workflow'}</button></div></div></div>}
+      {onboardingResult && <div className="finding-modal-overlay centered"><div className="diff-modal onboarding-result"><div className="detail-head"><div><span className="eyebrow">Onboarding result</span><h3>{onboardingResult.repo.full_name}</h3></div><button className="icon-btn small" onClick={() => setOnboardingResult(null)}><X /></button></div><dl className="detail-grid"><div><dt>Workflow</dt><dd>{onboardingStatusLabel(onboardingResult.workflow?.status || onboardingResult.status)}</dd></div><div><dt>Overall</dt><dd>{onboardingStatusLabel(onboardingResult.overall_status)}</dd></div></dl><section className="detail-section"><h3>Secrets</h3>{(onboardingResult.secrets || []).length === 0 ? <p>No analysis-tool secret checks were required or repository access could not be verified.</p> : <div className="onboarding-secrets">{onboardingResult.secrets.map(secret => <div key={secret.name}><Pill tone={secret.status === 'CONFIGURED' ? 'success' : secret.status === 'MISSING' ? 'warning' : 'danger'}>{secret.status === 'CONFIGURED' ? '✓ Configured' : secret.status === 'MISSING' ? '⚠ Missing' : '⚠ Unable to verify'}</Pill><strong>{secret.name}</strong>{secret.status === 'CONFIGURED' && <span className="onboarding-secret-actions"><button className="outline" onClick={() => keepOnboardingSecret(secret.name)}>Keep Existing</button><button className="primary" onClick={() => setOnboardingReplace({ repo: onboardingResult.repo, secretName: secret.name })}>Replace</button></span>}{secret.kept && <small>Existing secret will be kept.</small>}{secret.replaced && <small>✓ Secret replaced successfully.</small>}{secret.reason && <small>{secret.reason}</small>}</div>)}</div>}</section>{(onboardingResult.secrets || []).some(secret => secret.status !== 'CONFIGURED') && <div className="detail-actions"><button className="primary" onClick={() => { setOnboardingResult(null); onOpenSettings(); }}>Configure repository secrets</button></div>}</div></div>}
+      {onboardingReplace && <div className="finding-modal-overlay centered"><div className="diff-modal replace-secret-modal"><div className="detail-head"><h3>Replace {onboardingReplace.secretName}</h3><button className="icon-btn small" onClick={() => { setOnboardingReplacementValue(''); setOnboardingReplace(null); }}><X /></button></div><p>This will replace the existing GitHub Actions secret. The current value cannot be viewed or recovered.</p><label className="replace-secret-value">New secret value<input type="password" value={onboardingReplacementValue} onChange={event => setOnboardingReplacementValue(event.target.value)} autoComplete="new-password" /></label><div className="detail-actions"><button className="outline" onClick={() => { setOnboardingReplacementValue(''); setOnboardingReplace(null); }}>Cancel</button><button className="primary" disabled={!onboardingReplacementValue || busy[onboardingReplace.repo.full_name]} onClick={replaceOnboardingSecret}>Replace Secret</button></div></div></div>}
     </section>
   );
 }
 
 function RepositoryDetail({ repo, onBack, onOpenTool }) {
   const [payload, setPayload] = useState(null);
+  const [filterBy, setFilterBy] = useState('tool');
   const [toolFilter, setToolFilter] = useState('all');
+  const [severityFilter, setSeverityFilter] = useState('all');
+  const [selectedSeverityFinding, setSelectedSeverityFinding] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const load = async () => {
@@ -429,6 +556,22 @@ function RepositoryDetail({ repo, onBack, onOpenTool }) {
     if (tool.status === 'SKIPPED') return { label: '— Skipped', tone: 'neutral' };
     return { label: `${tool.finding_count} ${tool.finding_count === 1 ? 'finding' : 'findings'}`, tone: 'warning' };
   };
+  const severityRank = { critical: 0, high: 1, medium: 2, low: 3 };
+  const severityFindings = findings
+    .filter(finding => severityFilter === 'all' || String(finding.severity || '').toLowerCase() === severityFilter)
+    .sort((left, right) => {
+      const leftRank = severityRank[String(left.severity || '').toLowerCase()] ?? 4;
+      const rightRank = severityRank[String(right.severity || '').toLowerCase()] ?? 4;
+      return leftRank - rightRank;
+    });
+  const applySeverityRecheck = useCallback(result => {
+    const lifecycle = result.lifecycle || { status: result.status };
+    const updateFinding = finding => finding.finding_id === result.finding_id
+      ? { ...finding, lifecycle: { ...(finding.lifecycle || {}), ...lifecycle } }
+      : finding;
+    setPayload(current => current ? { ...current, findings: (current.findings || []).map(updateFinding) } : current);
+    setSelectedSeverityFinding(current => current ? updateFinding(current) : current);
+  }, []);
 
   if (loading) return <div className="empty-state">Loading real findings…</div>;
   return (
@@ -438,9 +581,24 @@ function RepositoryDetail({ repo, onBack, onOpenTool }) {
       {error && <div className="error-callout"><AlertTriangle /> {error}</div>}
       {!payload?.run_id ? <div className="empty-state"><ListChecks /><h2>Not yet scanned</h2><p>Run an analysis from the repository list. Demo findings are not shown.</p></div> : <>
         <div className="summary-grid"><div className="metric"><div><strong>{openFindings.length}</strong><small>Open findings</small></div></div>{['critical', 'high', 'medium', 'low'].map(level => <div className="metric" key={level}><div><strong>{severityCounts[level] || 0}</strong><small>{level}</small></div></div>)}<div className="metric"><div><strong>{tools.length}</strong><small>Tools represented</small></div></div></div>
-        <div className="panel tools-panel"><div className="panel-head"><div><span className="eyebrow">Latest report</span><h3>Tools</h3></div><label className="tool-filter"><Filter /><select value={toolFilter} onChange={event => setToolFilter(event.target.value)}><option value="all">All</option><option value="findings">With findings</option><option value="clean">Clean</option><option value="failed">Failed / Skipped</option></select></label></div>{tools.length === 0 ? <div className="empty-state compact">No tool execution metadata is available in this report.</div> : filteredTools.length === 0 ? <div className="empty-state compact">No tools match this filter.</div> : <div className="tool-grid">{filteredTools.map(tool => { const result = toolResult(tool); return <button key={tool.id} title={tool.error_message || undefined} onClick={() => onOpenTool({ repo, tool, runId: payload.run_id, branch: payload.branch, commitSha: payload.commit_sha })}><span><Activity /><strong>{tool.label}</strong></span><Pill tone={result.tone}>{result.label}</Pill></button>; })}</div>}</div>
+        <div className="panel tools-panel">
+          <div className="panel-head">
+            <div><span className="eyebrow">Latest report</span><h3>{filterBy === 'tool' ? 'Tools' : 'Findings by severity'}</h3></div>
+            <div className="filter-controls">
+              <label className="tool-filter">Filter by <select value={filterBy} onChange={event => setFilterBy(event.target.value)}><option value="tool">Tool</option><option value="severity">Severity</option></select></label>
+              {filterBy === 'tool' ? <label className="tool-filter"><Filter /><select value={toolFilter} onChange={event => setToolFilter(event.target.value)}><option value="all">All</option><option value="findings">With findings</option><option value="clean">Clean</option><option value="failed">Failed / Skipped</option></select></label> : <label className="tool-filter"><Filter /><select value={severityFilter} onChange={event => setSeverityFilter(event.target.value)}><option value="all">All Severities</option><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>}
+            </div>
+          </div>
+          {filterBy === 'tool' ? <>
+            {tools.length === 0 ? <div className="empty-state compact">No tool execution metadata is available in this report.</div> : filteredTools.length === 0 ? <div className="empty-state compact">No tools match this filter.</div> : <div className="tool-grid">{filteredTools.map(tool => { const result = toolResult(tool); return <button key={tool.id} title={tool.error_message || undefined} onClick={() => onOpenTool({ repo, tool, runId: payload.run_id, branch: payload.branch, commitSha: payload.commit_sha })}><span><Activity /><strong>{tool.label}</strong></span><Pill tone={result.tone}>{result.label}</Pill></button>; })}</div>}
+          </> : <div className="findings-table">
+            <div className="finding-row finding-head"><span>Severity</span><span>Rule / check</span><span>Description</span><span>Location</span><span>Status</span></div>
+            {severityFindings.length === 0 ? <div className="empty-state compact">No findings match this severity.</div> : severityFindings.map(finding => { const location = findingLocation(finding); const status = findingStatus(finding); return <button className="finding-row" key={finding.finding_id} onClick={() => setSelectedSeverityFinding(finding)}><Pill tone={severityTone(finding.severity)}>{finding.severity || 'unknown'}</Pill><code>{finding.rule_id || 'No rule ID'}</code><span>{finding.title || finding.description || 'Untitled finding'}</span><span>{location.file || 'Unknown'}{location.line ? `:${location.line}` : ''}</span><Pill tone={status === 'FIXED' ? 'success' : status === 'RECHECKING' ? 'neutral' : 'warning'}>{status}</Pill></button>; })}
+          </div>}
+        </div>
         {Object.keys(severityCounts).some(key => !['critical', 'high', 'medium', 'low'].includes(key)) && <p className="security-note">Additional severities in the real report: {Object.entries(severityCounts).filter(([key]) => !['critical', 'high', 'medium', 'low'].includes(key)).map(([key, value]) => `${key} ${value}`).join(', ')}.</p>}
       </>}
+      {selectedSeverityFinding && <FindingDetail finding={selectedSeverityFinding} repository={repo.full_name} branch={payload?.branch} commitSha={payload?.commit_sha} toolLabel={findingAnalysisTools(selectedSeverityFinding)[0] || findingTools(selectedSeverityFinding)[0] || 'Analysis'} onClose={() => setSelectedSeverityFinding(null)} onRecheck={applySeverityRecheck} />}
     </section>
   );
 }
