@@ -116,7 +116,7 @@ jobs:
           python -m pip install --upgrade pip
 
           pip install \
-            ruff bandit semgrep pip-audit mypy pytest import-linter \
+            ruff bandit semgrep pip-audit mypy pytest import-linter owasp-depscan \
             google-genai openai psycopg pydantic requests pyyaml
 
           sudo apt-get update && sudo apt-get install -y cloc || true
@@ -124,9 +124,9 @@ jobs:
           npm install -g \
             snyk \
             @cyclonedx/cdxgen \
+            @owasp/dep-scan \
             dependency-cruiser \
-            react-doctor \
-            deslint || true
+            react-doctor
 
       # =========================================================
       # Execute Analysis
