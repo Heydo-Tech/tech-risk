@@ -47,6 +47,10 @@ git checkout -b "$BRANCH_NAME"
 # Create workflow
 mkdir -p .github/workflows
 
+ORCHESTRATOR_OWNER="${ORCHESTRATOR_OWNER:-manasvipaweria}"
+ORCHESTRATOR_REPO="${ORCHESTRATOR_REPO:-tech-risk}"
+ORCHESTRATOR_REF="${ORCHESTRATOR_REF:-main}"
+
 # Triggers configuration
 TRIGGERS="${TRIGGERS:-pull_request}"
 if [ "$TRIGGERS" = "push,pull_request" ]; then
@@ -63,13 +67,69 @@ name: Code Analysis
 
 on:
 $ON_CONFIG
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Analysis Run ID'
+        required: false
+        type: string
+      recheck_finding_id:
+        description: 'Finding ID for a targeted recheck'
+        required: false
+        type: string
+      recheck_attempt_id:
+        required: false
+        type: string
+      recheck_tool:
+        required: false
+        type: string
+      recheck_rule_id:
+        required: false
+        type: string
+      recheck_file_path:
+        required: false
+        type: string
+      recheck_line_start:
+        required: false
+        type: string
+      recheck_line_end:
+        required: false
+        type: string
+      recheck_commit_sha:
+        required: false
+        type: string
 
 jobs:
   analysis:
-    uses: manasvipaweria/repo-analysis/.github/workflows/reusable-analysis.yml@main
+    if: \${{ github.event_name != 'workflow_dispatch' || inputs.recheck_finding_id == '' }}
+    uses: ${ORCHESTRATOR_OWNER}/${ORCHESTRATOR_REPO}/.github/workflows/reusable-analysis.yml@${ORCHESTRATOR_REF}
+    with:
+      enable_codex: true
+      enable_design_ai: true
+      enable_deslint: true
+      run_id: \${{ github.event.inputs.run_id }}
     secrets:
       SNYK_TOKEN: \${{ secrets.SNYK_TOKEN }}
       GEMINI_API_KEY: \${{ secrets.GEMINI_API_KEY }}
+      OPENAI_API_KEY: \${{ secrets.OPENAI_API_KEY }}
+      ANALYSIS_BACKEND_URL: \${{ secrets.ANALYSIS_BACKEND_URL }}
+      ANALYSIS_SECRET: \${{ secrets.ANALYSIS_SECRET }}
+  recheck:
+    if: \${{ github.event_name == 'workflow_dispatch' && inputs.recheck_finding_id != '' }}
+    uses: ${ORCHESTRATOR_OWNER}/${ORCHESTRATOR_REPO}/.github/workflows/reusable-finding-recheck.yml@${ORCHESTRATOR_REF}
+    with:
+      finding_id: \${{ inputs.recheck_finding_id }}
+      attempt_id: \${{ inputs.recheck_attempt_id }}
+      tool: \${{ inputs.recheck_tool }}
+      rule_id: \${{ inputs.recheck_rule_id }}
+      file_path: \${{ inputs.recheck_file_path }}
+      line_start: \${{ inputs.recheck_line_start }}
+      line_end: \${{ inputs.recheck_line_end }}
+      commit_sha: \${{ inputs.recheck_commit_sha }}
+    secrets:
+      SNYK_TOKEN: \${{ secrets.SNYK_TOKEN }}
+      ANALYSIS_BACKEND_URL: \${{ secrets.ANALYSIS_BACKEND_URL }}
+      ANALYSIS_SECRET: \${{ secrets.ANALYSIS_SECRET }}
 YML_EOF
 
 echo "✅ Created workflow at: $WORKFLOW_FILE"

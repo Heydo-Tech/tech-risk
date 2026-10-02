@@ -7,29 +7,14 @@ import argparse
 import urllib.request
 import urllib.error
 
+from src.core.onboarding import generate_expected_workflow, classify_workflow_content
+
 GITHUB_API_URL = "https://api.github.com"
 DEFAULT_REF = "main"
 TEMPLATE_PATH = ".github/workflows/code-analysis.yml"
 
 def generate_template(orchestrator_ref):
-    return f"""name: Code Analysis
-
-on:
-  push:
-  pull_request:
-
-jobs:
-  analysis:
-    uses: manasvipaweria/repo-analysis/.github/workflows/reusable-analysis.yml@{orchestrator_ref}
-    with:
-      enable_codex: true
-      enable_design_ai: true
-      enable_deslint: true
-    secrets:
-      SNYK_TOKEN: ${{{{ secrets.SNYK_TOKEN }}}}
-      GEMINI_API_KEY: ${{{{ secrets.GEMINI_API_KEY }}}}
-      OPENAI_API_KEY: ${{{{ secrets.OPENAI_API_KEY }}}}
-"""
+    return generate_expected_workflow(orchestrator_ref)
 
 class GitHubClient:
     def __init__(self, token):
@@ -224,15 +209,10 @@ def main():
         try:
             content, sha = client.get_file_content(repo_name, TEMPLATE_PATH)
             
-            state = "UNKNOWN"
             if content is None:
                 state = "NEEDS_ONBOARDING"
-            elif content == desired_content:
-                state = "UP_TO_DATE"
-            elif "uses: manasvipaweria/repo-analysis/.github/workflows/reusable-analysis.yml" in content:
-                state = "DRIFT"
             else:
-                state = "CUSTOMIZED"
+                state = classify_workflow_content(content, args.orchestrator_ref)
                 
             stats[state] += 1
             print(f"[{state}] {repo_name}")

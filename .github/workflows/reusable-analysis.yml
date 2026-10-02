@@ -87,7 +87,7 @@ jobs:
       - name: Checkout orchestrator repository
         uses: actions/checkout@v4
         with:
-          repository: manasvipaweria/repo-analysis
+          repository: manasvipaweria/tech-risk
           ref: ${{ inputs.orchestrator_ref }}
           path: orchestrator-repo
 
@@ -138,6 +138,11 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           ANALYSIS_RUN_ID: ${{ inputs.run_id }}
+
+          AI_PROVIDER: gemini
+          GEMINI_MODEL: gemini-3.5-flash
+          AI_BATCH_SIZE: '5'
+          AI_MAX_OUTPUT_TOKENS: '4000'
 
           ENABLE_DESIGN_AI: ${{ inputs.enable_design_ai }}
           ENABLE_DESLINT: ${{ inputs.enable_deslint }}

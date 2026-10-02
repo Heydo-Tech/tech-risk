@@ -56,6 +56,21 @@ python analyze_repo.py https://github.com/user/repo
 - `--branch main` : Analyze a specific branch.
 - `--tools ruff,bandit,pytest,snyk` : Selectively run a subset of tools.
 - `--output json,csv` : Select output formats.
+- `--persist` : Store `report.json` in PostgreSQL (requires `--database-url` or `DATABASE_URL`).
+
+### Local PostgreSQL persistence
+
+Reports can be stored outside the target repository as PostgreSQL `JSONB`. The
+first run creates the `analysis_runs` table and indexes automatically:
+
+```bash
+set DATABASE_URL=postgresql://user:password@localhost:5432/repo_analysis
+python analyze_repo.py . --repo-name Heydo-Tech/example --tools ruff --output json --persist
+```
+
+Each row keeps the complete report plus repository, commit SHA, branch, and
+workflow run metadata. PostgreSQL support is optional; analysis continues to
+work as before when `--persist` is not supplied.
 
 ## Adding a New Tool Adapter
 
@@ -105,12 +120,12 @@ on:
 
 jobs:
   analyze:
-    uses: manasvipaweria/repo-analysis/.github/workflows/reusable-analysis.yml@main
+    uses: manasvipaweria/tech-risk/.github/workflows/reusable-analysis.yml@main
 ```
 
 ### What happens during execution?
 1. **Target repository**: GitHub Actions checks out the target repository (e.g., `Custom-Assembler`).
-2. **Central repo-analysis workflow**: It fetches this central orchestrator.
+2. **Central tech-risk workflow**: It fetches this central orchestrator.
 3. **V2 analysis**: It runs the orchestrator against the target repository. The `code_context` will be safely extracted from the target repository's files.
 4. **JSON + CSV**: It generates the reports with the target repository's identifier (e.g., `manasvipaweria/Custom-Assembler`).
 5. **Artifact**: The reports are uploaded as the `repo-analysis-report` artifact to the target repository's workflow run.

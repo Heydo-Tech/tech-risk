@@ -1,10 +1,49 @@
+import os
 import base64
 import json
 import difflib
 import requests
 from typing import Dict, Any, Optional, Tuple
 
-EXPECTED_WORKFLOW = """name: Code Analysis
+# This is the single source of truth for the central caller workflow's enabled
+# analysis configuration.  It mirrors the defaults passed to reusable-analysis.
+DEFAULT_ANALYSIS_CONFIGURATION = {
+    "tools": "ruff,bandit,semgrep,pip-audit,mypy,pytest,import-linter,snyk,dep-scan,dependency-cruiser,sonarqube,react-doctor,apnimandi-design",
+    "enable_codex": True,
+    "enable_design_ai": True,
+    "run_ai": True,
+}
+
+
+def required_analysis_secrets(configuration: Optional[Dict[str, Any]] = None) -> list[str]:
+    """Return only secrets needed by the enabled analysis tools.
+
+    Callback/database settings are intentionally excluded: they are workflow
+    infrastructure rather than credentials required by an analysis tool.
+    """
+    effective = {**DEFAULT_ANALYSIS_CONFIGURATION, **(configuration or {})}
+    tools = effective.get("tools") or ""
+    tool_names = {item.strip().lower() for item in (tools.split(",") if isinstance(tools, str) else tools) if item}
+    required = []
+    if effective.get("run_ai") or effective.get("enable_design_ai"):
+        required.append("GEMINI_API_KEY")
+    if effective.get("enable_codex"):
+        required.append("OPENAI_API_KEY")
+    if "snyk" in tool_names:
+        required.append("SNYK_TOKEN")
+    return required
+
+ORCHESTRATOR_OWNER = os.environ.get("ORCHESTRATOR_OWNER", "manasvipaweria")
+ORCHESTRATOR_REPO = os.environ.get("ORCHESTRATOR_REPO", "tech-risk")
+
+def get_orchestrator_full_name() -> str:
+    owner = os.environ.get("ORCHESTRATOR_OWNER", ORCHESTRATOR_OWNER)
+    repo = os.environ.get("ORCHESTRATOR_REPO", ORCHESTRATOR_REPO)
+    return f"{owner}/{repo}"
+
+def generate_expected_workflow(orchestrator_ref: str = "main") -> str:
+    full_name = get_orchestrator_full_name()
+    return f"""name: Code Analysis
 
 on:
   push:
@@ -43,36 +82,74 @@ on:
 
 jobs:
   analysis:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.recheck_finding_id == '' }}
-    uses: manasvipaweria/repo-analysis/.github/workflows/reusable-analysis.yml@main
+    if: ${{{{ github.event_name != 'workflow_dispatch' || inputs.recheck_finding_id == '' }}}}
+    uses: {full_name}/.github/workflows/reusable-analysis.yml@{orchestrator_ref}
     with:
       enable_codex: true
       enable_design_ai: true
       enable_deslint: true
-      run_id: ${{ github.event.inputs.run_id }}
+      run_id: ${{{{ github.event.inputs.run_id }}}}
     secrets:
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      ANALYSIS_BACKEND_URL: ${{ secrets.ANALYSIS_BACKEND_URL }}
-      ANALYSIS_SECRET: ${{ secrets.ANALYSIS_SECRET }}
+      SNYK_TOKEN: ${{{{ secrets.SNYK_TOKEN }}}}
+      GEMINI_API_KEY: ${{{{ secrets.GEMINI_API_KEY }}}}
+      OPENAI_API_KEY: ${{{{ secrets.OPENAI_API_KEY }}}}
+      ANALYSIS_BACKEND_URL: ${{{{ secrets.ANALYSIS_BACKEND_URL }}}}
+      ANALYSIS_SECRET: ${{{{ secrets.ANALYSIS_SECRET }}}}
   recheck:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.recheck_finding_id != '' }}
-    uses: manasvipaweria/repo-analysis/.github/workflows/reusable-finding-recheck.yml@main
+    if: ${{{{ github.event_name == 'workflow_dispatch' && inputs.recheck_finding_id != '' }}}}
+    uses: {full_name}/.github/workflows/reusable-finding-recheck.yml@{orchestrator_ref}
     with:
-      finding_id: ${{ inputs.recheck_finding_id }}
-      attempt_id: ${{ inputs.recheck_attempt_id }}
-      tool: ${{ inputs.recheck_tool }}
-      rule_id: ${{ inputs.recheck_rule_id }}
-      file_path: ${{ inputs.recheck_file_path }}
-      line_start: ${{ inputs.recheck_line_start }}
-      line_end: ${{ inputs.recheck_line_end }}
-      commit_sha: ${{ inputs.recheck_commit_sha }}
+      finding_id: ${{{{ inputs.recheck_finding_id }}}}
+      attempt_id: ${{{{ inputs.recheck_attempt_id }}}}
+      tool: ${{{{ inputs.recheck_tool }}}}
+      rule_id: ${{{{ inputs.recheck_rule_id }}}}
+      file_path: ${{{{ inputs.recheck_file_path }}}}
+      line_start: ${{{{ inputs.recheck_line_start }}}}
+      line_end: ${{{{ inputs.recheck_line_end }}}}
+      commit_sha: ${{{{ inputs.recheck_commit_sha }}}}
     secrets:
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-      ANALYSIS_BACKEND_URL: ${{ secrets.ANALYSIS_BACKEND_URL }}
-      ANALYSIS_SECRET: ${{ secrets.ANALYSIS_SECRET }}
+      SNYK_TOKEN: ${{{{ secrets.SNYK_TOKEN }}}}
+      ANALYSIS_BACKEND_URL: ${{{{ secrets.ANALYSIS_BACKEND_URL }}}}
+      ANALYSIS_SECRET: ${{{{ secrets.ANALYSIS_SECRET }}}}
 """
+
+EXPECTED_WORKFLOW = generate_expected_workflow("main")
+
+def classify_workflow_content(content: str, orchestrator_ref: str = "main") -> str:
+    if not content or not content.strip():
+        return "NOT_ONBOARDED"
+    expected = generate_expected_workflow(orchestrator_ref)
+    if _normalize(content) == _normalize(expected):
+        return "UP_TO_DATE"
+
+    try:
+        import yaml
+        parsed = yaml.safe_load(content)
+        if isinstance(parsed, dict) and "jobs" in parsed and isinstance(parsed["jobs"], dict):
+            jobs = parsed["jobs"]
+            uses_reusable = False
+            has_custom_jobs = False
+            for job_name, job_data in jobs.items():
+                if isinstance(job_data, dict) and "uses" in job_data:
+                    uses_val = str(job_data.get("uses") or "")
+                    if "/.github/workflows/reusable-analysis.yml" in uses_val or "/.github/workflows/reusable-finding-recheck.yml" in uses_val:
+                        uses_reusable = True
+                    elif job_name not in ("analysis", "recheck"):
+                        has_custom_jobs = True
+                elif job_name not in ("analysis", "recheck"):
+                    has_custom_jobs = True
+
+            if uses_reusable:
+                if has_custom_jobs:
+                    return "CUSTOMIZED"
+                return "DRIFT"
+    except Exception:
+        pass
+
+    if "/.github/workflows/reusable-analysis.yml" in content or "reusable-analysis.yml" in content:
+        return "DRIFT"
+
+    return "CUSTOMIZED"
 
 WORKFLOW_PATH = ".github/workflows/code-analysis.yml"
 BRANCH_PREFIX = "chore/onboard-repo-analysis"
@@ -176,10 +253,8 @@ def check_onboarding_status(token: str, owner: str, repo: str) -> Tuple[str, Dic
         content_json = f_resp.json()
         if "content" in content_json:
             current_content = base64.b64decode(content_json["content"]).decode("utf-8", errors="replace")
-            if _normalize(current_content) == _normalize(EXPECTED_WORKFLOW):
-                return "UP_TO_DATE", {"default_branch": default_branch, "file_sha": content_json.get("sha")}
-            else:
-                return "DRIFT", {"default_branch": default_branch, "current_content": current_content, "file_sha": content_json.get("sha")}
+            status = classify_workflow_content(current_content)
+            return status, {"default_branch": default_branch, "current_content": current_content, "file_sha": content_json.get("sha")}
                 
     # 3. If workflow file does not exist, check for open onboarding PRs
     prs_resp = requests.get(f"https://api.github.com/repos/{full_name}/pulls?state=open", headers=headers, timeout=10)
@@ -199,12 +274,17 @@ def check_onboarding_status(token: str, owner: str, repo: str) -> Tuple[str, Dic
                 
     return "NOT_ONBOARDED", {"default_branch": default_branch}
 
-def onboard_repository(token: str, owner: str, repo: str) -> Dict[str, Any]:
+def onboard_repository(
+    token: str,
+    owner: str,
+    repo: str,
+    preflight: Optional[Tuple[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     full_name = f"{owner}/{repo}"
     headers = _headers(token)
     
-    status, details = check_onboarding_status(token, owner, repo)
-    if status in ("UP_TO_DATE", "ERROR"):
+    status, details = preflight or check_onboarding_status(token, owner, repo)
+    if status in ("UP_TO_DATE", "CUSTOMIZED", "ERROR"):
         return {"status": status, **details}
     if status == "ONBOARDING_PR_OPEN":
         return {"status": status, **details}
@@ -345,10 +425,11 @@ def onboard_repository(token: str, owner: str, repo: str) -> Dict[str, Any]:
         ),
     }
 
-def compute_diff(current_content: str) -> str:
+def compute_diff(current_content: str, orchestrator_ref: str = "main") -> str:
+    expected = generate_expected_workflow(orchestrator_ref)
     diff_lines = difflib.unified_diff(
         current_content.splitlines(),
-        EXPECTED_WORKFLOW.splitlines(),
+        expected.splitlines(),
         fromfile="current/.github/workflows/code-analysis.yml",
         tofile="expected/.github/workflows/code-analysis.yml",
         lineterm=""
