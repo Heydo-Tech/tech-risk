@@ -1,6 +1,6 @@
 import os
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from src.core.onboarding import (
     generate_expected_workflow,
     classify_workflow_content,
@@ -13,8 +13,8 @@ def test_canonical_workflow_generator_default():
     """Scenario 1: Default orchestrator owner and repo in generated workflow."""
     with patch.dict(os.environ, {}, clear=True):
         workflow = generate_expected_workflow("main")
-        assert "uses: manasvipaweria/tech-risk/.github/workflows/reusable-analysis.yml@main" in workflow
-        assert "uses: manasvipaweria/tech-risk/.github/workflows/reusable-finding-recheck.yml@main" in workflow
+        assert "uses: Heydo-Tech/tech-risk/.github/workflows/reusable-analysis.yml@main" in workflow
+        assert "uses: Heydo-Tech/tech-risk/.github/workflows/reusable-finding-recheck.yml@main" in workflow
         assert "analysis:" in workflow
         assert "recheck:" in workflow
 
@@ -64,7 +64,7 @@ on:
   push:
 jobs:
   analysis:
-    uses: manasvipaweria/tech-risk/.github/workflows/reusable-analysis.yml@main
+    uses: Heydo-Tech/tech-risk/.github/workflows/reusable-analysis.yml@main
   custom_build_step:
     runs-on: ubuntu-latest
     steps:

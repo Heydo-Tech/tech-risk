@@ -47,7 +47,7 @@ git checkout -b "$BRANCH_NAME"
 # Create workflow
 mkdir -p .github/workflows
 
-ORCHESTRATOR_OWNER="${ORCHESTRATOR_OWNER:-manasvipaweria}"
+ORCHESTRATOR_OWNER="${ORCHESTRATOR_OWNER:-Heydo-Tech}"
 ORCHESTRATOR_REPO="${ORCHESTRATOR_REPO:-tech-risk}"
 ORCHESTRATOR_REF="${ORCHESTRATOR_REF:-main}"
 

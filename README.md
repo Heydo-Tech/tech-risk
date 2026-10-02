@@ -119,7 +119,7 @@ on:
 jobs:
   analysis:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.recheck_finding_id == '' }}
-    uses: manasvipaweria/tech-risk/.github/workflows/reusable-analysis.yml@main
+    uses: Heydo-Tech/tech-risk/.github/workflows/reusable-analysis.yml@main
     with:
       enable_codex: true
       enable_design_ai: true
@@ -133,7 +133,7 @@ jobs:
       ANALYSIS_SECRET: ${{ secrets.ANALYSIS_SECRET }}
   recheck:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.recheck_finding_id != '' }}
-    uses: manasvipaweria/tech-risk/.github/workflows/reusable-finding-recheck.yml@main
+    uses: Heydo-Tech/tech-risk/.github/workflows/reusable-finding-recheck.yml@main
     with:
       finding_id: ${{ inputs.recheck_finding_id }}
       attempt_id: ${{ inputs.recheck_attempt_id }}

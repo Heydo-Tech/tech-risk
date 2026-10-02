@@ -87,7 +87,7 @@ jobs:
       - name: Checkout orchestrator repository
         uses: actions/checkout@v4
         with:
-          repository: manasvipaweria/tech-risk
+          repository: Heydo-Tech/tech-risk
           ref: ${{ inputs.orchestrator_ref }}
           path: orchestrator-repo
 

@@ -10,7 +10,7 @@ def mock_client():
 
 def test_generate_template():
     content = generate_template("v1")
-    assert "uses: manasvipaweria/tech-risk/.github/workflows/reusable-analysis.yml@v1" in content
+    assert "uses: Heydo-Tech/tech-risk/.github/workflows/reusable-analysis.yml@v1" in content
     assert "enable_codex: true" in content
     assert "enable_deslint: true" in content
     assert "enable_design_ai: true" in content

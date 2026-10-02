@@ -126,8 +126,8 @@ def main():
         description="Repository Onboarding",
         epilog="Examples:\n"
                "  python onboard_org.py --org Heydo-Tech\n"
-               "  python onboard_org.py --owner manasvipaweria\n"
-               "  python onboard_org.py --repo manasvipaweria/Steady",
+               "  python onboard_org.py --owner Heydo-Tech\n"
+               "  python onboard_org.py --repo Heydo-Tech/Steady",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--org", help="Target an entire GitHub Organization")
@@ -217,7 +217,7 @@ def main():
             stats[state] += 1
             print(f"[{state}] {repo_name}")
             
-            if state == "UP_TO_DATE" or state == "CUSTOMIZED":
+            if state in {"UP_TO_DATE", "CUSTOMIZED"}:
                 continue
                 
             if state == "DRIFT" and not args.fix_drift and not args.dry_run:
@@ -255,7 +255,7 @@ def main():
             body = "This PR onboards or updates the repository to the central security and AI code analysis pipeline."
             
             client.create_pr(repo_name, title, body, branch_name, default_branch)
-            print(f"  -> PR created successfully.")
+            print("  -> PR created successfully.")
             prs_created += 1
             stats["PR_CREATED"] += 1
             

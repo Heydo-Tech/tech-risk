@@ -33,7 +33,7 @@ def required_analysis_secrets(configuration: Optional[Dict[str, Any]] = None) ->
         required.append("SNYK_TOKEN")
     return required
 
-ORCHESTRATOR_OWNER = os.environ.get("ORCHESTRATOR_OWNER", "manasvipaweria")
+ORCHESTRATOR_OWNER = os.environ.get("ORCHESTRATOR_OWNER", "Heydo-Tech")
 ORCHESTRATOR_REPO = os.environ.get("ORCHESTRATOR_REPO", "tech-risk")
 
 def get_orchestrator_full_name() -> str:
@@ -115,6 +115,23 @@ jobs:
 
 EXPECTED_WORKFLOW = generate_expected_workflow("main")
 
+def _analyze_yaml_jobs(parsed: Any) -> Tuple[bool, bool]:
+    if not isinstance(parsed, dict) or "jobs" not in parsed or not isinstance(parsed["jobs"], dict):
+        return False, False
+    uses_reusable = False
+    has_custom_jobs = False
+    for job_name, job_data in parsed["jobs"].items():
+        is_standard_name = job_name in ("analysis", "recheck")
+        if isinstance(job_data, dict) and "uses" in job_data:
+            uses_val = str(job_data.get("uses") or "")
+            if "/.github/workflows/reusable-analysis.yml" in uses_val or "/.github/workflows/reusable-finding-recheck.yml" in uses_val:
+                uses_reusable = True
+            elif not is_standard_name:
+                has_custom_jobs = True
+        elif not is_standard_name:
+            has_custom_jobs = True
+    return uses_reusable, has_custom_jobs
+
 def classify_workflow_content(content: str, orchestrator_ref: str = "main") -> str:
     if not content or not content.strip():
         return "NOT_ONBOARDED"
@@ -125,24 +142,9 @@ def classify_workflow_content(content: str, orchestrator_ref: str = "main") -> s
     try:
         import yaml
         parsed = yaml.safe_load(content)
-        if isinstance(parsed, dict) and "jobs" in parsed and isinstance(parsed["jobs"], dict):
-            jobs = parsed["jobs"]
-            uses_reusable = False
-            has_custom_jobs = False
-            for job_name, job_data in jobs.items():
-                if isinstance(job_data, dict) and "uses" in job_data:
-                    uses_val = str(job_data.get("uses") or "")
-                    if "/.github/workflows/reusable-analysis.yml" in uses_val or "/.github/workflows/reusable-finding-recheck.yml" in uses_val:
-                        uses_reusable = True
-                    elif job_name not in ("analysis", "recheck"):
-                        has_custom_jobs = True
-                elif job_name not in ("analysis", "recheck"):
-                    has_custom_jobs = True
-
-            if uses_reusable:
-                if has_custom_jobs:
-                    return "CUSTOMIZED"
-                return "DRIFT"
+        uses_reusable, has_custom_jobs = _analyze_yaml_jobs(parsed)
+        if uses_reusable:
+            return "CUSTOMIZED" if has_custom_jobs else "DRIFT"
     except Exception:
         pass
 

@@ -94,7 +94,7 @@ The following environment variables control server runtime, orchestrator executi
 | `DATABASE_URL` | Server / CLI | PostgreSQL connection string | `postgresql://postgres:password@localhost:5432/repo_analysis` |
 | `ANALYSIS_SECRET` | Backend / Actions | Shared bearer token for authenticating workflow callbacks | User-generated random secret |
 | `ANALYSIS_BACKEND_URL` | Actions Runner | Base URL of the backend API for receiving completed reports | `https://api.yourdomain.com` |
-| `ORCHESTRATOR_OWNER` | Onboarding | GitHub owner of the central orchestrator repo | `manasvipaweria` (or `Heydo-Tech`) |
+| `ORCHESTRATOR_OWNER` | Onboarding | GitHub owner of the central orchestrator repo | `Heydo-Tech` |
 | `ORCHESTRATOR_REPO` | Onboarding | Central orchestrator repo name | `tech-risk` |
 | `GEMINI_API_KEY` | Actions / CLI | API key for Gemini AI analysis | — |
 | `OPENAI_API_KEY` | Actions / CLI | API key for OpenAI Codex security scanners | — |
@@ -129,7 +129,7 @@ PostgreSQL persistence is managed via [`src/storage/postgres.py`](src/storage/po
 ### Local Environment Setup
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/manasvipaweria/tech-risk.git
+   git clone https://github.com/Heydo-Tech/tech-risk.git
    cd tech-risk
    ```
 
