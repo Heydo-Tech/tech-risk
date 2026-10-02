@@ -1,183 +1,251 @@
-# Unified Repo Analysis Orchestrator
+# Unified Repository Risk & Analysis Orchestrator (`tech-risk`)
 
-A unified Python orchestrator that runs code analysis, security, quality, and testing tools against a Git repository and produces a single normalized report (JSON and CSV).
+A centralized security, statutory compliance, and code quality governance platform that orchestrates static analysis tools across Git repositories via GitHub Actions, performs AI-assisted semantic finding analysis, tracks token usage/costs, and presents telemetry through a REST API and React UI dashboard.
 
-## Features
-- Clones target repository securely into a temporary directory.
-- Runs a configurable suite of tools: Ruff, Bandit, Semgrep, Pip-audit, Mypy, Pytest (with coverage), and Import-Linter.
-- Normalizes findings across all tools into a consistent format.
-- Deduplicates overlapping findings across tools to reduce noise.
-- Explicitly handles tool statuses (`COMPLETED`, `SKIPPED`, `ERROR`) to ensure `PASSED` means 100% clean.
-- Outputs detailed JSON and summary-inclusive CSV reports.
+> **Note**: This system performs automated risk scanning and statutory rule evaluation to assist development teams. It does not provide legal advice, legal compliance certification, or guaranteed security immunity.
 
-## Supported Tools
+---
 
-### Python Ecosystem
-- **Ruff**: Linting and code quality
-- **Bandit**: Security analysis (SAST)
-- **Pip-audit**: Dependency vulnerabilities
-- **Mypy**: Static type checking
-- **Pytest**: Unit testing and coverage
-- **Import-Linter**: Architecture and dependency rules
-- **Semgrep**: Advanced SAST across languages
+## 📖 Documentation Quick Links
 
-### JS/TS/Node/React Ecosystem
-- **Snyk Open Source**: Dependency vulnerabilities. Requires `snyk` CLI installed and authenticated (`snyk auth`). Handles multiple package manifests.
-- **OWASP dep-scan**: Dependency vulnerabilities mapping to CVEs/GHSAs. Defaults to the lightweight `app` scope. Silent huge VDB downloads are prevented by default. Set `DEPSCAN_AUTO_DOWNLOAD=true` or run `depscan-vdb download --scope app` manually to fetch the database. Includes a configurable execution timeout (default 600s).
-- **Dependency-Cruiser**: Architecture and forbidden dependency analysis. Requires `.dependency-cruiser.js` configuration.
-- **SonarQube Community**: Code quality and SAST. Requires `sonar-scanner` and `sonar-project.properties` (or `SONAR_HOST_URL` env var).
-- **React Doctor**: Code quality and best practices for React repositories. Automatically detects React via `package.json` or `.jsx`/`.tsx` files.
-- **Semgrep**: Advanced SAST across languages.
+- **User & Functional Documentation**: Read this file (`README.md`).
+- **Developer & Technical Documentation**: Read [`DEVELOPER_README.md`](DEVELOPER_README.md) for architecture, API schemas, local environment setup, and extension guides.
 
-*Note: The orchestrator automatically detects the ecosystem based on files (e.g. `package.json`, `.py`, `.jsx`) and gracefully skips tools that are not applicable to the repository. If a tool crashes or times out, it is isolated and the orchestrator continues with the remaining tools safely.*
+---
 
-## Setup
+## 🌟 Key Capabilities & System Features
 
-1. Install Python requirements:
-   ```bash
-   pip install -r requirements.txt
-   ```
+1. **Multi-Ecosystem Static Analysis Orchestration**:
+   - Executes Python tools (Ruff, Bandit, Pip-audit, Mypy, Pytest, Import-Linter), JS/React tools (Snyk Open Source, OWASP dep-scan, Dependency-Cruiser, React Doctor, Deslint), and multi-language SAST (Semgrep, SonarQube).
+   - Automatically detects project languages and gracefully skips non-applicable tools.
+   - Isolates tool execution errors so a single scanner failure never halts the overall pipeline.
 
-2. Make sure the tools you intend to use are available in your `PATH`.
-   - JS tools can be installed globally via npm (e.g. `npm install -g snyk @owasp/dep-scan dependency-cruiser`).
-   - SonarQube requires the `sonar-scanner` executable.
-   - Snyk requires authentication via `snyk auth`.
+2. **Compliance & Statutory Risk Detection**:
+   - Built-in compliance classification engines evaluating code against regulatory frameworks: **GDPR**, **DPDP Act 2023**, **EU Cyber Resilience Act (CRA)**, **SPDI Rules**, **TCPA**, and **TRAI DLT**.
 
-## Usage
+3. **AI Semantic Reasoning & Secret Redaction**:
+   - Enriches findings with AI-assisted severity evaluation, contextual explanation, and remediation suggestions using Gemini or OpenAI models.
+   - Features automated secret redaction before sending code contexts to LLM APIs.
 
-Run the orchestrator by passing the URL to a repository (or a local directory path):
+4. **Token Telemetry & Cost Visibility**:
+   - Calculates prompt/candidate token consumption and USD costs per model tier (Gemini 3.5 Flash, GPT-4, etc.) based on actual usage telemetry.
 
+5. **Automated Organization Onboarding & Drift Control**:
+   - Bulk-onboards GitHub organizations or accounts by creating standardized caller workflow pull requests (`.github/workflows/code-analysis.yml`).
+   - Detects workflow drift and protects customized target workflows with custom jobs from automated overwrites.
+
+6. **Targeted Finding Rechecks**:
+   - Allows users to dispatch lightweight, single-finding revalidation jobs on targeted commit SHAs directly from the UI or API.
+
+7. **Centralized REST API & React Dashboard**:
+   - Browse repository risk profiles, run summaries, findings severity breakdown, AI cost metrics, download reports/artifacts (JSON, CSV, ZIP), and trigger targeted rechecks.
+
+---
+
+## 🚀 System Workflows & Operations
+
+### 1. Repository Onboarding Workflow
+To onboard target repositories to the central analysis pipeline:
+
+#### Option A: Bulk Onboarding CLI (`onboard_org.py`)
+Run the Python onboarding CLI against an organization, user, or single repository:
 ```bash
-python analyze_repo.py https://github.com/user/repo
+export GITHUB_TOKEN="your_github_token"
+python onboard_org.py --org Heydo-Tech --check-drift --fix-drift
 ```
 
-### Options
+**Required `GITHUB_TOKEN` Permissions**:
+- `Contents`: Read & Write (to create onboarding setup branches and commit workflow files).
+- `Workflows`: Read & Write (required by GitHub API when committing files under `.github/workflows/`).
+- `Pull Requests`: Read & Write (to open onboarding PRs).
+- `Organization / User Repositories`: Read (to discover repositories).
 
-- `--branch main` : Analyze a specific branch.
-- `--tools ruff,bandit,pytest,snyk` : Selectively run a subset of tools.
-- `--output json,csv` : Select output formats.
-- `--persist` : Store `report.json` in PostgreSQL (requires `--database-url` or `DATABASE_URL`).
+**Status Classifications**:
+- `UP_TO_DATE`: Workflow matches canonical configuration.
+- `NEEDS_ONBOARDING`: Creates a setup branch and Pull Request on the target repository.
+- `DRIFT`: Identifies outdated central workflow references and creates update PRs when `--fix-drift` is passed.
+- `CUSTOMIZED`: Skips repositories with custom jobs to prevent overwriting user logic and flags them for manual review.
 
-### Local PostgreSQL persistence
-
-Reports can be stored outside the target repository as PostgreSQL `JSONB`. The
-first run creates the `analysis_runs` table and indexes automatically:
-
+#### Option B: Standalone Shell Script (`onboard.sh`)
+Target repository maintainers can execute `onboard.sh` directly inside their repository:
 ```bash
-set DATABASE_URL=postgresql://user:password@localhost:5432/repo_analysis
-python analyze_repo.py . --repo-name Heydo-Tech/example --tools ruff --output json --persist
+bash onboard.sh
 ```
 
-Each row keeps the complete report plus repository, commit SHA, branch, and
-workflow run metadata. PostgreSQL support is optional; analysis continues to
-work as before when `--persist` is not supplied.
+---
 
-## Adding a New Tool Adapter
+### 2. Code Analysis Pipeline (`.github/workflows/code-analysis.yml`)
+Once onboarded, target repositories execute the central pipeline on `push`, `pull_request`, or `workflow_dispatch`.
 
-1. Create a new file in `src/adapters/` (e.g., `newtool_adapter.py`).
-2. Implement the `BaseAdapter` class.
-3. Parse the tool's native output and convert it into `Finding` dataclasses.
-4. Add the adapter to the `ALL_ADAPTERS` dictionary in `analyze_repo.py`.
-
-```python
-from src.adapters.base import BaseAdapter
-from src.core.models import ToolResult, ToolStatus
-
-class NewToolAdapter(BaseAdapter):
-    @property
-    def tool_name(self) -> str:
-        return "new-tool"
-
-    @property
-    def categories(self) -> list:
-        return ["security"]
-
-    def run(self, repo_path: str) -> ToolResult:
-        # Run tool via subprocess
-        # Parse output
-        # Return ToolResult
-        pass
-```
-
-## GitHub Actions CI Integration
-
-This repository acts as the central hub for the Repo Analysis Orchestrator. It exposes a **Reusable GitHub Actions workflow** (`.github/workflows/reusable-analysis.yml`).
-
-### Calling the Reusable Workflow
-You can integrate this orchestrator into any other repository without copying its code.
-
-Create a workflow file in your target repository (e.g., `Custom-Assembler/.github/workflows/code-analysis.yml`):
-
+#### Canonical Caller Workflow
 ```yaml
 name: Code Analysis
 
 on:
   push:
-    branches: [ "**" ]
   pull_request:
-    branches: [ "**" ]
   workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Analysis Run ID'
+        required: false
+        type: string
+      recheck_finding_id:
+        description: 'Finding ID for a targeted recheck'
+        required: false
+        type: string
+      recheck_attempt_id:
+        required: false
+        type: string
+      recheck_tool:
+        required: false
+        type: string
+      recheck_rule_id:
+        required: false
+        type: string
+      recheck_file_path:
+        required: false
+        type: string
+      recheck_line_start:
+        required: false
+        type: string
+      recheck_line_end:
+        required: false
+        type: string
+      recheck_commit_sha:
+        required: false
+        type: string
 
 jobs:
-  analyze:
+  analysis:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.recheck_finding_id == '' }}
     uses: manasvipaweria/tech-risk/.github/workflows/reusable-analysis.yml@main
+    with:
+      enable_codex: true
+      enable_design_ai: true
+      enable_deslint: true
+      run_id: ${{ github.event.inputs.run_id }}
+    secrets:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANALYSIS_BACKEND_URL: ${{ secrets.ANALYSIS_BACKEND_URL }}
+      ANALYSIS_SECRET: ${{ secrets.ANALYSIS_SECRET }}
+  recheck:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.recheck_finding_id != '' }}
+    uses: manasvipaweria/tech-risk/.github/workflows/reusable-finding-recheck.yml@main
+    with:
+      finding_id: ${{ inputs.recheck_finding_id }}
+      attempt_id: ${{ inputs.recheck_attempt_id }}
+      tool: ${{ inputs.recheck_tool }}
+      rule_id: ${{ inputs.recheck_rule_id }}
+      file_path: ${{ inputs.recheck_file_path }}
+      line_start: ${{ inputs.recheck_line_start }}
+      line_end: ${{ inputs.recheck_line_end }}
+      commit_sha: ${{ inputs.recheck_commit_sha }}
+    secrets:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      ANALYSIS_BACKEND_URL: ${{ secrets.ANALYSIS_BACKEND_URL }}
+      ANALYSIS_SECRET: ${{ secrets.ANALYSIS_SECRET }}
 ```
 
-### What happens during execution?
-1. **Target repository**: GitHub Actions checks out the target repository (e.g., `Custom-Assembler`).
-2. **Central tech-risk workflow**: It fetches this central orchestrator.
-3. **V2 analysis**: It runs the orchestrator against the target repository. The `code_context` will be safely extracted from the target repository's files.
-4. **JSON + CSV**: It generates the reports with the target repository's identifier (e.g., `manasvipaweria/Custom-Assembler`).
-5. **Artifact**: The reports are uploaded as the `repo-analysis-report` artifact to the target repository's workflow run.
+---
 
-### AI Analysis Stage
+### 3. Targeted Finding Recheck Workflow
+When a developer addresses a specific security or quality finding, they can initiate a targeted recheck without running a full repository scan.
 
-The orchestrator now supports an AI-powered post-processing stage to validate findings, reduce false positives, and provide concrete remediation suggestions. 
+- **Triggering via UI/API**: Select a finding in the React Dashboard and click **Recheck Finding**.
+- **Execution**: Dispatches the `recheck` job in `.github/workflows/reusable-finding-recheck.yml` targeting the specified file path and commit SHA.
+- **Result Statuses**:
+  - `FIXED`: Finding is no longer present on the target commit.
+  - `STILL_PRESENT`: Finding persists.
+  - `FAILED`: Recheck was inconclusive or tool execution failed.
 
-To run the AI analysis, use the `--run-ai` flag:
+---
+
+### 4. Viewing Telemetry & Downloading Reports
+1. **React Dashboard**: Open `http://localhost:5173` (or production URL) to view repository lists, run details, findings breakdown, and collapsible AI Usage / Cost & Token Visibility cards.
+2. **Report Downloads**: Download complete reports and artifacts in multiple formats:
+   - **JSON**: `/api/reports/{run_id}/download/json`
+   - **CSV**: `/api/reports/{run_id}/download/csv`
+   - **ZIP Archive**: `/api/reports/{run_id}/download/zip` (or `/api/reports/{run_id}/download/artifact`)
+
+---
+
+## 🖥️ Local System Setup & Running the Dashboard
+
+### 1. Start FastAPI Backend Server
+```bash
+# Set database connection string (optional; falls back to SQLite/in-memory if unconfigured)
+export DATABASE_URL="postgresql://postgres:password@localhost:5432/repo_analysis"
+
+# Launch backend API server
+uvicorn src.api.server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### 2. Start React Frontend Dashboard
+```bash
+cd frontend
+npm install
+npm run dev
+```
+Open `http://localhost:5173` in your browser.
+
+---
+
+## 🔐 Credentials & Required Permissions
+
+| Context | Required Credentials / Secrets | Scope / Purpose |
+| :--- | :--- | :--- |
+| **GitHub Actions Runner** | `GEMINI_API_KEY`, `OPENAI_API_KEY` | Access to Gemini 3.5 / OpenAI APIs for AI analysis |
+| **Snyk Scanning** | `SNYK_TOKEN` | Access to Snyk vulnerability database |
+| **Backend Callback** | `ANALYSIS_BACKEND_URL`, `ANALYSIS_SECRET` | Backend endpoint authentication for run ingestion |
+| **Organization Onboarding** | `GITHUB_TOKEN` | `Contents:write`, `Workflows:write`, `Pull Requests:write` |
+
+---
+
+## 🛠️ Local CLI Usage
+
+Run the orchestrator directly from the command line against any local folder or public repository URL:
 
 ```bash
-python analyze_repo.py https://github.com/user/repo --run-ai
+# Basic run
+python analyze_repo.py https://github.com/user/repo
+
+# Selective tools & AI analysis
+python analyze_repo.py . --tools ruff,bandit,semgrep --run-ai
+
+# Local PostgreSQL persistence
+export DATABASE_URL="postgresql://postgres:password@localhost:5432/repo_analysis"
+python analyze_repo.py . --repo-name Heydo-Tech/example --tools ruff --output json --persist
 ```
 
-#### How it works:
-1. **Report Processor**: After the standard scanners generate `report.json`, the Report Processor validates finding counts and extracts only the relevant data needed for AI reasoning into a smaller `ai_input.json` file, shedding unnecessary tool metadata.
-2. **Secret Redaction**: Before `ai_input.json` is generated, a mandatory secret redaction layer scrubs the `message` and `code_context` fields for sensitive credentials (API keys, JWTs, cloud credentials, etc.), replacing them with `[REDACTED_SECRET]`.
-3. **AI Adapter**: The generic AI adapter reads `ai_input.json`, loads the versioned skill instructions (`src/ai/skills/ai_analysis_v1.txt`), and queries the configured AI provider.
-4. **AI Enriched Report**: The adapter writes the structural AI response back into the original `report.json`, appending `ai_fields` to the corresponding findings. 
+### Verified CLI Options
 
-#### AI Configuration
-The orchestrator uses a provider-agnostic architecture. Set the following environment variables:
-- `AI_PROVIDER`: The provider to use (`mock`, `openai`, `gemini`). Defaults to `openai`.
-- `AI_BATCH_SIZE`: Controls how many findings are analyzed initially (defaults to `5`).
-- `AI_MAX_OUTPUT_TOKENS`: Maximum tokens the model may generate (defaults to `500`).
+#### `analyze_repo.py` Options
+- `repo_url`: URL or local path of the repository to analyze.
+- `--repo-name REPO_NAME`: Report identifier when analyzing a local directory.
+- `--branch BRANCH`: Branch or commit to check out.
+- `--tools TOOLS`: Comma-separated list of tools to run.
+- `--output OUTPUT`: Output report formats (`json`, `csv`).
+- `--run-ai`: Run AI post-processing stage.
+- `--persist`: Store report in PostgreSQL.
+- `--database-url DATABASE_URL`: PostgreSQL connection string.
+- `--commit-sha COMMIT_SHA`, `--workflow-run-id WORKFLOW_RUN_ID`, `--run-id RUN_ID`: Internal metadata.
+- `--backend-url BACKEND_URL`: Backend API URL for status callbacks.
 
-**OpenAI Provider (`AI_PROVIDER=openai`)**
-- `AI_API_KEY`: Your OpenAI API key.
-- `AI_API_URL`: The API endpoint (defaults to OpenAI chat completions).
-- `AI_MODEL`: The model to use (defaults to `gpt-4-turbo-preview`).
+#### `onboard_org.py` Options
+- `--org ORG`: Target an entire GitHub Organization.
+- `--owner OWNER`: Target a GitHub personal account/user.
+- `--repo REPO`: Target a specific repository (`owner/repo`).
+- `--dry-run`: Preview changes without creating branches or PRs.
+- `--limit LIMIT`: Maximum number of PRs to create.
+- `--check-drift`: Only check for workflow drift.
+- `--fix-drift`: Create PRs to fix drifted repositories.
+- `--orchestrator-ref ORCHESTRATOR_REF`: Reusable workflow ref (defaults to `main`).
 
-**Gemini Provider (`AI_PROVIDER=gemini`)**
-- `GEMINI_API_KEY`: Your Gemini API key.
-- `GEMINI_MODEL`: The model to use (defaults to `gemini-3.5-flash`).
+---
 
-**Mock Provider (`AI_PROVIDER=mock`)**
-No credentials required. Fast, deterministic, completely local response. The output explicitly labels itself as mock and does not represent a real security assessment.
+## 💻 Developer Guide & Technical Reference
 
-If credentials are required but missing, the AI stage gracefully skips. 
-
-#### Token Estimation (Dry Run)
-You can estimate token usage without consuming API quota or making network calls:
-```bash
-python -m src.ai.ai_adapter ai_input.json report.json --estimate-tokens
-```
-This local calculation evaluates your skill and input size (using approximation heuristics where exact provider tokenizers are not locally available).
-
-### Adding a new AI Provider
-To add a new AI provider, create a new class in `src/ai/providers/` extending `AIProvider`. Implement the `analyze` and `estimate_tokens` methods, then register it in `AIAdapter.__init__`. The core logic (`report_processor.py` and finding schemas) requires zero modification.
-
-### Future Enhancements
-The following features are intentionally deferred to a later phase and are not yet implemented:
-- Automatic code fixes pushed back to the branch
-- Historical / new-finding incremental analysis comparison
-- Production/Merge blocking enforcement natively within GitHub branch protection
+For comprehensive developer documentation, repository architecture maps, backend API route specs, database schemas, testing strategies, and extension guides, please refer to [`DEVELOPER_README.md`](DEVELOPER_README.md).
